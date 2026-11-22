@@ -464,6 +464,7 @@ describe('Auth, KYC, subscriptions and read endpoints (e2e)', () => {
         .expect(200);
       expect(summary.body.dca).toEqual({
         balance: 2 * sats(980),
+        bonus: 0,
         spent: 1960,
         fees: 40,
         avg_btc_price: expect.any(Number),

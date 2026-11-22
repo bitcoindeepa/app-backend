@@ -23,6 +23,7 @@ describe('First-timer reward (e2e)', () => {
     payment_id: string;
     subscription_id?: string;
     status_code?: string;
+    order_id?: string;
   }) =>
     http()
       .post('/transaction/payhere-webhook')
@@ -31,6 +32,14 @@ describe('First-timer reward (e2e)', () => {
   const tx = (id: string) =>
     ctx.knex('transaction').where({ payhere_pay_id: id }).first();
   const user = () => ctx.knex('user').where({ id: USER }).first();
+  const newCheckout = async () => {
+    const res = await http()
+      .post('/subscription/payhere-link')
+      .set('Authorization', `Bearer ${ctx.tokenFor(USER)}`)
+      .send({ package_id: PACKAGE_WEEKLY })
+      .expect(201);
+    return new URL(res.body.link as string).searchParams.get('order_id')!;
+  };
   const settle = () =>
     ctx.app.get(SettlementService).retryUnsettledTransactions();
 
@@ -45,12 +54,7 @@ describe('First-timer reward (e2e)', () => {
   beforeEach(async () => {
     process.env.FIRST_TIMER_REWARD_LKR = String(REWARD_LKR);
     await resetData(ctx);
-    const res = await http()
-      .post('/subscription/payhere-link')
-      .set('Authorization', `Bearer ${ctx.tokenFor(USER)}`)
-      .send({ package_id: PACKAGE_WEEKLY })
-      .expect(201);
-    orderId = new URL(res.body.link as string).searchParams.get('order_id')!;
+    orderId = await newCheckout();
   });
 
   it('adds the bonus to the first SUCCESS and sends it with the purchase in one transfer', async () => {
@@ -108,25 +112,94 @@ describe('First-timer reward (e2e)', () => {
   });
 
   it('only one of two first payments arriving together gets it', async () => {
-    // The subscription exists (a PENDING charge doesn't count as paid)
-    await notify({
-      payment_id: 'P0',
-      subscription_id: 'S1',
-      status_code: '0',
-    }).expect(200);
+    // Two checkouts, two subscriptions: nothing serializes the two payments
+    // except the claim on the member's row
+    const order2 = await newCheckout();
 
-    await Promise.all([
+    // Hold the member's row so both webhooks queue up on it, then let them
+    // race through the claim together
+    const blocker = await ctx.knex.transaction();
+    await blocker('user').where({ id: USER }).forUpdate().first();
+    const requests = Promise.all([
       notify({ payment_id: 'P1', subscription_id: 'S1' }).expect(200),
-      notify({ payment_id: 'P2', subscription_id: 'S1' }).expect(200),
+      notify({
+        payment_id: 'P2',
+        subscription_id: 'S2',
+        order_id: order2,
+      }).expect(200),
     ]);
+    for (let i = 0; i < 100; i++) {
+      const { rows } = await ctx.knex.raw<{ rows: { n: string }[] }>(
+        "select count(*) as n from pg_stat_activity where wait_event_type = 'Lock' and datname = current_database()",
+      );
+      if (Number(rows[0].n) >= 2) break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    await blocker.commit();
+    await requests;
 
-    const withBonus = await ctx
+    const paid = await ctx
       .knex('transaction')
-      .whereNotNull('bonus_lkr')
-      .select('payhere_pay_id');
+      .where({ status: 'SUCCESS' })
+      .select('payhere_pay_id', 'bonus_lkr');
+    expect(paid).toHaveLength(2);
+    const withBonus = paid.filter((p) => p.bonus_lkr !== null);
     expect(withBonus).toHaveLength(1);
     expect((await user()).first_timer_reward_payment_id).toBe(
       withBonus[0].payhere_pay_id,
+    );
+  });
+
+  it('an earlier paid charge without transaction.user_id still counts (matched by subscription owner)', async () => {
+    delete process.env.FIRST_TIMER_REWARD_LKR;
+    await notify({ payment_id: 'P1', subscription_id: 'S1' }).expect(200);
+    // As left by an older build, before fillMissingTransactionOwners runs
+    await ctx
+      .knex('transaction')
+      .where({ payhere_pay_id: 'P1' })
+      .update({ user_id: null });
+
+    process.env.FIRST_TIMER_REWARD_LKR = String(REWARD_LKR);
+    await notify({ payment_id: 'P2', subscription_id: 'S1' }).expect(200);
+    expect(await tx('P2')).toMatchObject({ bonus_lkr: null });
+    expect((await user()).first_timer_reward_payment_id).toBeNull();
+  });
+
+  it('a resent SUCCESS that prices the purchase prices its bonus too', async () => {
+    const price = ctx.app.get(BitcoinPriceService);
+    const spy = jest
+      .spyOn(price, 'calculateSatoshis')
+      .mockResolvedValueOnce(null);
+    await notify({ payment_id: 'P1', subscription_id: 'S1' }).expect(200);
+    spy.mockRestore();
+    expect(await tx('P1')).toMatchObject({
+      satoshis_purchased: null,
+      bonus_satoshis: null,
+    });
+
+    // No backfill: the resent notification prices the payment
+    await notify({ payment_id: 'P1', subscription_id: 'S1' }).expect(200);
+    const p1 = await tx('P1');
+    expect(Number(p1.satoshis_purchased)).toBe(sats(980));
+    expect(Number(p1.bonus_satoshis)).toBe(sats(REWARD_LKR));
+    expect((await user()).first_timer_reward_payment_id).toBe('P1');
+  });
+
+  it('recovers a priced purchase whose bonus was left unpriced', async () => {
+    await notify({ payment_id: 'P1', subscription_id: 'S1' }).expect(200);
+    await ctx
+      .knex('transaction')
+      .where({ payhere_pay_id: 'P1' })
+      .update({ bonus_satoshis: null });
+
+    await settle();
+    expect(ctx.bitcoinDeepa.transferFunds).not.toHaveBeenCalled();
+
+    await ctx.app.get(TransactionService).backfillMissingBitcoinData();
+    expect(Number((await tx('P1')).bonus_satoshis)).toBe(sats(REWARD_LKR));
+    await settle();
+    expect(Number(ctx.bitcoinDeepa.transferFunds.mock.calls[0][0])).toBe(
+      sats(980) + sats(REWARD_LKR),
     );
   });
 

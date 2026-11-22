@@ -22,6 +22,8 @@ export interface AdminTransaction {
   grossLkr: number | null;
   netLkr: number | null;
   satoshis: number | null;
+  /** First-timer reward sent with this payment (null = none) */
+  bonusSatoshis: number | null;
   user: { id: string; name: string } | null;
   packageName: string | null;
 }

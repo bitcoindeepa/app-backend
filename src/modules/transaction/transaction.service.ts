@@ -738,6 +738,10 @@ export class TransactionService {
       // Any transition into SUCCESS: a new SUCCESS row or PENDING → SUCCESS
       if (becameSuccess) {
         await this.claimFirstTimerReward(trx, payment_id, userId);
+      } else if (status === 'SUCCESS') {
+        // A resent SUCCESS can price a payment first claimed during a price
+        // outage: price its bonus too (never claims a new reward)
+        await this.priceBonus(trx, payment_id);
       }
 
       if (becameSuccess && subscription && !subscriptionEnded) {
@@ -881,11 +885,19 @@ export class TransactionService {
     const rewardLkr = firstTimerRewardLkr();
     if (!rewardLkr || !user_id) return;
 
-    const earlier = await trx<Transaction>('transaction')
-      .where('user_id', user_id)
-      .whereNot('payhere_pay_id', payment_id)
-      .whereIn('status', ['SUCCESS', 'CHARGEBACK'])
-      .first('payhere_pay_id');
+    // Older rows may still have no transaction.user_id (filled from the
+    // subscription by fillMissingTransactionOwners), so match the subscription
+    // owner too: an earlier paid charge must count either way
+    const earlier = await trx('transaction as t')
+      .leftJoin('subscription as s', 't.payhere_sub_id', 's.payhere_sub_id')
+      .where((qb) => {
+        void qb.where('t.user_id', user_id).orWhere((q) => {
+          void q.whereNull('t.user_id').where('s.user_id', user_id);
+        });
+      })
+      .whereNot('t.payhere_pay_id', payment_id)
+      .whereIn('t.status', ['SUCCESS', 'CHARGEBACK'])
+      .first<{ payhere_pay_id: string } | undefined>('t.payhere_pay_id');
     if (earlier) return;
 
     const claimed = await trx('user')
@@ -1437,6 +1449,9 @@ export class TransactionService {
    */
   @Cron(CronExpression.EVERY_MINUTE)
   async backfillMissingBitcoinData(): Promise<void> {
+    // Needs no price API: uses each purchase's stored price
+    await this.priceStrandedBonuses();
+
     if (process.env.ENABLE_BITCOIN_TRACKING === 'false') return;
 
     try {
@@ -1481,16 +1496,19 @@ export class TransactionService {
           return; // price source still down - try again next run
         }
 
-        const updated = await this.knexService
-          .knex('transaction')
-          .update(data)
-          .where('payhere_pay_id', row.payhere_pay_id)
-          .where('status', 'SUCCESS')
-          .whereNull('satoshis_purchased');
+        // Purchase and bonus are priced together (same price, one commit), so
+        // a crash can't leave a priced purchase with an unpriced bonus
+        const updated = await this.knexService.knex.transaction(async (trx) => {
+          const n = await trx('transaction')
+            .update(data)
+            .where('payhere_pay_id', row.payhere_pay_id)
+            .where('status', 'SUCCESS')
+            .whereNull('satoshis_purchased');
+          if (n) await this.priceBonus(trx, row.payhere_pay_id);
+          return n;
+        });
 
         if (updated) {
-          // Same price as the purchase; settlement waits for it
-          await this.priceBonus(this.knexService.knex, row.payhere_pay_id);
           this.logger.warn(
             `Backfilled Bitcoin data for ${row.payhere_pay_id}: ${data.satoshis_purchased} sats at ${data.btc_price_at_purchase} (priced by the backfill, not at payment time; price as of ${data.coingecko_timestamp?.toISOString()})`,
           );
@@ -1499,6 +1517,38 @@ export class TransactionService {
       }
     } catch (error: unknown) {
       this.logger.error(`Bitcoin data backfill failed: ${errorMessage(error)}`);
+    }
+  }
+
+  /**
+   * Recovery: a priced purchase whose first-timer bonus isn't priced (e.g. a
+   * row priced by an older build). Settlement waits for the bonus, and the
+   * backfill above only picks unpriced purchases, so price it here from the
+   * purchase's own price.
+   */
+  private async priceStrandedBonuses(): Promise<void> {
+    try {
+      const rows = await this.knexService
+        .knex<Transaction>('transaction')
+        .select('payhere_pay_id')
+        .whereNotNull('bonus_lkr')
+        .whereNull('bonus_satoshis')
+        .whereNotNull('btc_price_at_purchase')
+        .where('settled', false)
+        .limit(50);
+      for (const row of rows) {
+        const sats = await this.priceBonus(
+          this.knexService.knex,
+          row.payhere_pay_id,
+        );
+        this.logger.warn(
+          `Priced the first-timer bonus of ${row.payhere_pay_id} after its purchase: ${sats} sats`,
+        );
+      }
+    } catch (error: unknown) {
+      this.logger.error(
+        `First-timer bonus pricing failed: ${errorMessage(error)}`,
+      );
     }
   }
 
