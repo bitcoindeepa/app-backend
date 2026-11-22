@@ -26,6 +26,8 @@ import { PayHereService } from '../payhere/payhere.service';
 import { PayHereNotificationDto } from './dto/payhere-notification.dto';
 import { errorMessage } from '../../common/error-message';
 import { computeBuyFees } from '../../common/buy-fees';
+import { firstTimerRewardLkr } from '../../common/first-timer-reward';
+import { satoshisFor } from '../bitcoin-price/bitcoin-price.service';
 import { transferMemo } from '../settlement/transfer-memo';
 import { saleCollectMemo, SellStatus } from '../sell/sell.constants';
 import {
@@ -67,6 +69,10 @@ export interface Transaction {
   // decimal columns arrive from pg as strings; numbers are what we write
   btc_price_at_purchase?: number | string;
   satoshis_purchased?: number | string;
+  /** First-timer reward on the payment that claimed it (FIRST_TIMER_REWARD_LKR) */
+  bonus_lkr?: number | string | null;
+  /** bonus_lkr in sats at btc_price_at_purchase; sent with satoshis_purchased */
+  bonus_satoshis?: number | string | null;
   price_currency?: string;
   coingecko_timestamp?: Date;
   settled?: boolean;
@@ -98,7 +104,10 @@ type BitcoinData = Pick<
 
 export interface DcaSummary {
   dca: {
+    /** Purchased sats plus first-timer bonus sats */
     balance: number;
+    /** First-timer bonus sats included in balance (not in spent or avg_btc_price) */
+    bonus: number;
     /** Amount that went into BTC (after fees) */
     spent: number;
     /** Payment processor + BitcoinDeepa fees on those purchases */
@@ -535,6 +544,11 @@ export class TransactionService {
         alerts,
       });
 
+      // Any transition into SUCCESS: a new SUCCESS row or PENDING → SUCCESS
+      if (becameSuccess) {
+        await this.claimFirstTimerReward(trx, payment_id, userId);
+      }
+
       if (becameSuccess && subscription && !subscriptionEnded) {
         const duplicateOf = await this.activateIfFirstSuccess(
           trx,
@@ -655,6 +669,78 @@ export class TransactionService {
     }
 
     return reasons.length ? reasons.join('; ') : null;
+  }
+
+  /**
+   * Attach the first-timer reward to a payment that just became SUCCESS, if
+   * the reward is on and this is the member's first successful payment.
+   *
+   * The claim is a conditional update on the member's row (only while
+   * first_timer_reward_payment_id is null), so of two first payments arriving
+   * together only one gets it: the second waits on the row lock, and Postgres
+   * re-checks the WHERE against the committed row. Members who paid before
+   * the reward existed have an earlier SUCCESS/CHARGEBACK and don't qualify.
+   * A held one-time buy keeps its bonus; it is paid when the hold is released.
+   */
+  private async claimFirstTimerReward(
+    trx: Knex.Transaction,
+    payment_id: string,
+    user_id: string,
+  ): Promise<void> {
+    const rewardLkr = firstTimerRewardLkr();
+    if (!rewardLkr || !user_id) return;
+
+    const earlier = await trx<Transaction>('transaction')
+      .where('user_id', user_id)
+      .whereNot('payhere_pay_id', payment_id)
+      .whereIn('status', ['SUCCESS', 'CHARGEBACK'])
+      .first('payhere_pay_id');
+    if (earlier) return;
+
+    const claimed = await trx('user')
+      .where('id', user_id)
+      .whereNull('first_timer_reward_payment_id')
+      .update({ first_timer_reward_payment_id: payment_id })
+      .returning('id');
+    if (claimed.length === 0) return;
+
+    await trx('transaction')
+      .update({ bonus_lkr: rewardLkr })
+      .where('payhere_pay_id', payment_id);
+    const bonusSats = await this.priceBonus(trx, payment_id);
+    this.logger.log(
+      `First-timer reward claimed by user ${user_id} on ${payment_id}: ${rewardLkr} LKR${
+        bonusSats === null
+          ? ' (sats priced when the payment is)'
+          : ` = ${bonusSats} bonus sats`
+      }`,
+    );
+  }
+
+  /**
+   * Price a payment's first-timer bonus at the payment's own BTC price, once
+   * both are known. Called when the reward is claimed and when the backfill
+   * prices the payment. Returns the bonus sats, or null if not priced (yet).
+   */
+  private async priceBonus(
+    db: Knex | Knex.Transaction,
+    payment_id: string,
+  ): Promise<number | null> {
+    const row = await db<Transaction>('transaction')
+      .where('payhere_pay_id', payment_id)
+      .first('bonus_lkr', 'bonus_satoshis', 'btc_price_at_purchase');
+    if (!row?.bonus_lkr || !row.btc_price_at_purchase) return null;
+    if (row.bonus_satoshis != null) return toApiNumber(row.bonus_satoshis);
+
+    const bonusSats = satoshisFor(
+      String(row.bonus_lkr),
+      String(row.btc_price_at_purchase),
+    );
+    await db('transaction')
+      .update({ bonus_satoshis: bonusSats })
+      .where('payhere_pay_id', payment_id)
+      .whereNull('bonus_satoshis');
+    return bonusSats;
   }
 
   /**
@@ -1164,7 +1250,15 @@ export class TransactionService {
 
     try {
       const rows = await this.transactionsWithPackage()
-        .select(
+        .select<
+          {
+            payhere_pay_id: string;
+            gross_amount: string | null;
+            package_amount: string | null;
+            currency: string;
+            user_id: string;
+          }[]
+        >(
           't.payhere_pay_id',
           't.gross_amount',
           'p.amount as package_amount',
@@ -1204,6 +1298,8 @@ export class TransactionService {
           .whereNull('satoshis_purchased');
 
         if (updated) {
+          // Same price as the purchase; settlement waits for it
+          await this.priceBonus(this.knexService.knex, row.payhere_pay_id);
           this.logger.warn(
             `Backfilled Bitcoin data for ${row.payhere_pay_id}: ${data.satoshis_purchased} sats at ${data.btc_price_at_purchase} (priced by the backfill, not at payment time; price as of ${data.coingecko_timestamp?.toISOString()})`,
           );
@@ -1396,13 +1492,17 @@ export class TransactionService {
             payhere_pay_id: string;
             settled: boolean;
             satoshis_purchased: string | number | null;
+            bonus_satoshis: string | number | null;
             bot_payment_hash: string | null;
           }[]
-        >('payhere_pay_id', 'settled', 'satoshis_purchased', 'bot_payment_hash');
+        >('payhere_pay_id', 'settled', 'satoshis_purchased', 'bonus_satoshis', 'bot_payment_hash');
       for (const p of found) {
         purchases.set(p.payhere_pay_id, {
           settled: p.settled,
-          sats: toApiNumber(p.satoshis_purchased), // whole sats: exact
+          // The settlement transfer carries the first-timer bonus too
+          sats: toApiNumber(
+            toMoney(p.satoshis_purchased).plus(toMoney(p.bonus_satoshis)),
+          ), // whole sats: exact
           paymentHash: p.bot_payment_hash,
         });
       }
@@ -1561,7 +1661,8 @@ export class TransactionService {
       .whereNotNull('satoshis_purchased')
       .where('status', 'SUCCESS');
 
-    let totalSatoshis = toMoney(0);
+    let totalSatoshis = toMoney(0); // purchased only
+    let totalBonus = toMoney(0); // first-timer bonus: free, so no cost
     // "Invested" excludes fees so Current Value vs Invested shows market
     // movement only; fees are reported separately.
     let totalSpent = toMoney(0); // net amount that bought BTC
@@ -1572,6 +1673,7 @@ export class TransactionService {
       if (!tx.satoshis_purchased) continue;
       const sats = toMoney(tx.satoshis_purchased);
       totalSatoshis = totalSatoshis.plus(sats);
+      totalBonus = totalBonus.plus(toMoney(tx.bonus_satoshis));
 
       const btcCost = tx.btc_price_at_purchase
         ? sats.div(SATOSHIS_PER_BTC).times(toMoney(tx.btc_price_at_purchase))
@@ -1595,7 +1697,8 @@ export class TransactionService {
 
     return {
       dca: {
-        balance: toApiNumber(totalSatoshis),
+        balance: toApiNumber(totalSatoshis.plus(totalBonus)),
+        bonus: toApiNumber(totalBonus),
         spent: toApiNumber(totalSpent),
         fees: toApiNumber(totalFees),
         avg_btc_price: toApiNumber(averageBTCPrice),

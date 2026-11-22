@@ -1,4 +1,4 @@
-import { toApiNumber } from '../../common/money';
+import { toApiNumber, toMoney } from '../../common/money';
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { KnexService } from '../knex/knex.service';
@@ -24,6 +24,8 @@ interface UnsettledTransaction {
   /** Recurring charges */
   payhere_sub_id: string | null;
   satoshis_purchased: number | string; // bigint: pg returns a string
+  /** First-timer reward, sent in the same transfer (null = none) */
+  bonus_satoshis: number | string | null;
   retry_count: number;
   telegram_id: string;
   /** Why the last send didn't go through (UNKNOWN = may have gone, check the memo first) */
@@ -70,6 +72,7 @@ export class SettlementService {
             't.kind',
             't.payhere_sub_id',
             't.satoshis_purchased',
+            't.bonus_satoshis',
             't.retry_count',
             't.settlement_failure',
             't.transfer_memo',
@@ -84,6 +87,10 @@ export class SettlementService {
           .whereNull('t.bot_send_id')
           .whereNotNull('t.satoshis_purchased')
           .whereNotNull('t.btc_price_at_purchase')
+          // A first-timer bonus is sent with the purchase: wait until priced
+          .where((qb) => {
+            void qb.whereNull('t.bonus_lkr').orWhereNotNull('t.bonus_satoshis');
+          })
           .where('t.retry_count', '<', MAX_SETTLEMENT_ATTEMPTS)
           .where((qb) => {
             void qb
@@ -103,13 +110,20 @@ export class SettlementService {
     }
   }
 
+  static satsToSend(
+    t: Pick<UnsettledTransaction, 'satoshis_purchased' | 'bonus_satoshis'>,
+  ): string {
+    return toMoney(t.satoshis_purchased)
+      .plus(toMoney(t.bonus_satoshis))
+      .toFixed(0);
+  }
+
   private async tryTransactionSettlement(transaction: UnsettledTransaction) {
-    const {
-      payhere_pay_id,
-      telegram_id,
-      satoshis_purchased,
-      retry_count = 0,
-    } = transaction;
+    const { payhere_pay_id, telegram_id, retry_count = 0 } = transaction;
+    // What this transfer sends: the purchase plus any first-timer bonus. Every
+    // attempt sends the same total (bonus_satoshis is set before the first),
+    // so the memo still dedupes and findSettlementTransfer matches it.
+    const satsToSend = SettlementService.satsToSend(transaction);
     const currentRetryCount = retry_count + 1;
 
     // Atomically claim the row (FOR UPDATE SKIP LOCKED + retry_count check)
@@ -189,7 +203,7 @@ export class SettlementService {
           const found = await this.bitcoinDeepaService.findSettlementTransfer(
             Number(telegram_id),
             payhere_pay_id,
-            satoshis_purchased,
+            satsToSend,
           );
           if (found) {
             await this.markSettled(payhere_pay_id);
@@ -202,7 +216,7 @@ export class SettlementService {
               .where('retry_count', currentRetryCount);
             await this.telegramLogger.logAlert(
               'Settlement',
-              `Settlement of ${payhere_pay_id} was skipped (it is ${now} now), but an earlier send of ${satoshis_purchased} sats to user ${telegram_id} got no answer and a transfer with "(Ref: ${payhere_pay_id})" ${found === null ? "couldn't be looked up" : "isn't in their bot history"}. Check the bot before treating it as not sent.`,
+              `Settlement of ${payhere_pay_id} was skipped (it is ${now} now), but an earlier send of ${satsToSend} sats to user ${telegram_id} got no answer and a transfer with "(Ref: ${payhere_pay_id})" ${found === null ? "couldn't be looked up" : "isn't in their bot history"}. Check the bot before treating it as not sent.`,
             );
           }
         }
@@ -211,7 +225,7 @@ export class SettlementService {
 
       const logMessage = await this.telegramLogger.logSettlement(
         payhere_pay_id,
-        toApiNumber(satoshis_purchased), // whole sats: exact
+        toApiNumber(satsToSend), // whole sats: exact
         telegram_id,
         currentRetryCount,
       );
@@ -223,7 +237,7 @@ export class SettlementService {
         const found = await this.bitcoinDeepaService.findSettlementTransfer(
           Number(telegram_id),
           payhere_pay_id,
-          satoshis_purchased,
+          satsToSend,
         );
         if (found) {
           await this.markSettled(payhere_pay_id);
@@ -251,7 +265,7 @@ export class SettlementService {
       }
 
       const result = await this.bitcoinDeepaService.transferFunds(
-        satoshis_purchased,
+        satsToSend,
         telegram_id,
         memo,
       );
@@ -261,7 +275,7 @@ export class SettlementService {
         this.logger.log(
           result.already_completed
             ? `Settlement for ${payhere_pay_id} was already completed in a previous attempt`
-            : `Settled ${payhere_pay_id}: ${satoshis_purchased} sats to user ${telegram_id} (attempt ${currentRetryCount})`,
+            : `Settled ${payhere_pay_id}: ${satsToSend} sats to user ${telegram_id} (attempt ${currentRetryCount})`,
         );
         await this.telegramLogger.setMessageReaction(logMessage);
         return;
@@ -283,7 +297,7 @@ export class SettlementService {
           .where('retry_count', currentRetryCount);
         await this.telegramLogger.logAlert(
           'Settlement',
-          `Settlement of ${payhere_pay_id} (${satoshis_purchased} sats to user ${telegram_id}) is waiting for approval in the bot (transaction ${result.awaiting_approval_id}). It settles once approved.`,
+          `Settlement of ${payhere_pay_id} (${satsToSend} sats to user ${telegram_id}) is waiting for approval in the bot (transaction ${result.awaiting_approval_id}). It settles once approved.`,
         );
         return;
       }
@@ -342,11 +356,12 @@ export class SettlementService {
         {
           status: string;
           satoshis_purchased: string | number;
+          bonus_satoshis: string | number | null;
           user_id: string | null;
         }[]
-      >(['status', 'satoshis_purchased', 'user_id']);
+      >(['status', 'satoshis_purchased', 'bonus_satoshis', 'user_id']);
     if (row?.status === 'CHARGEBACK') {
-      const alert = `CHARGEBACK on ${payhere_pay_id} arrived while it was being settled: ${row.satoshis_purchased} sats were sent to user ${row.user_id} - manual reversal needed.`;
+      const alert = `CHARGEBACK on ${payhere_pay_id} arrived while it was being settled: ${SettlementService.satsToSend(row)} sats were sent to user ${row.user_id} - manual reversal needed.`;
       this.logger.error(alert);
       await this.telegramLogger.logAlert('Settlement', alert);
     }

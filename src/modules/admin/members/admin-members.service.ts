@@ -110,7 +110,7 @@ export class AdminMembersService {
         .joinRaw(
           `left join lateral (
             select coalesce(sum(t.gross_amount) filter (where t.settled), 0) as total_paid,
-                   coalesce(sum(t.satoshis_purchased) filter (where t.settled), 0) as satoshis,
+                   coalesce(sum(t.satoshis_purchased + coalesce(t.bonus_satoshis, 0)) filter (where t.settled), 0) as satoshis,
                    coalesce(sum(t.gross_amount) filter (where not t.settled), 0) as unsettled
             from "transaction" t
             where t.user_id = u.id and t.status = 'SUCCESS'

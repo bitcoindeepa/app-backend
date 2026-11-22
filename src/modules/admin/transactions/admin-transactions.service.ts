@@ -36,6 +36,7 @@ type Row = {
   gross_amount: string | null;
   net_amount: string | null;
   satoshis_purchased: string | null;
+  bonus_satoshis: string | null;
   user_id: string | null;
   first_name: string | null;
   last_name: string | null;
@@ -100,6 +101,7 @@ export class AdminTransactionsService {
           't.gross_amount',
           't.net_amount',
           't.satoshis_purchased',
+          't.bonus_satoshis',
           'u.id as user_id',
           'u.first_name',
           'u.last_name',
@@ -124,6 +126,8 @@ export class AdminTransactionsService {
       grossLkr: toApiNumberOrNull(row.gross_amount),
       netLkr: toApiNumberOrNull(row.net_amount),
       satoshis: toApiNumberOrNull(row.satoshis_purchased),
+      // First-timer reward sent with this payment (null = none)
+      bonusSatoshis: toApiNumberOrNull(row.bonus_satoshis),
       user: row.user_id
         ? {
             id: row.user_id,
