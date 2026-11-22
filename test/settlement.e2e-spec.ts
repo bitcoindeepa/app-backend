@@ -650,6 +650,49 @@ describe('Settlement (e2e)', () => {
     expect(ctx.bitcoinDeepa.transferFunds).toHaveBeenCalledTimes(2);
   });
 
+  it('after BUSY (a send with this memo was still running) the next attempt checks the bot history first', async () => {
+    ctx.bitcoinDeepa.transferFunds.mockResolvedValueOnce({
+      success: false,
+      failure: 'BUSY',
+      message: "Transaction with memo 'x' is already processing",
+    });
+    await settlement.retryUnsettledTransactions();
+    expect(await tx()).toMatchObject({ settlement_failure: 'BUSY' });
+
+    await ctx
+      .knex('transaction')
+      .where({ payhere_pay_id: 'P1' })
+      .update({ last_retry_at: new Date(0) });
+    ctx.bitcoinDeepa.findSettlementTransfer.mockResolvedValueOnce(true);
+    await settlement.retryUnsettledTransactions();
+    expect(ctx.bitcoinDeepa.findSettlementTransfer).toHaveBeenCalled();
+    expect(ctx.bitcoinDeepa.transferFunds).toHaveBeenCalledTimes(1);
+    expect(await tx()).toMatchObject({ settled: true });
+  });
+
+  it('does not report a refusal as stopped when the payment was reset during the send', async () => {
+    const alert = jest.spyOn(ctx.app.get(TelegramLoggerService), 'logAlert');
+    ctx.bitcoinDeepa.transferFunds.mockImplementationOnce(async () => {
+      // a human resets it while the send is running
+      await ctx
+        .knex('transaction')
+        .where({ payhere_pay_id: 'P1' })
+        .update({ retry_count: 0, last_retry_at: null });
+      return {
+        success: false,
+        failure: 'OVER_LIMIT',
+        message: 'Amount cannot exceed 300,000 sats',
+      };
+    });
+    await settlement.retryUnsettledTransactions();
+    expect(await tx()).toMatchObject({ retry_count: 0 });
+    expect(alert).not.toHaveBeenCalledWith(
+      'Settlement',
+      expect.stringContaining("Retrying won't help"),
+    );
+    alert.mockRestore();
+  });
+
   it('a stale snapshot (row already claimed by another run) does not transfer', async () => {
     // Simulates two instances that both loaded the row at retry_count 0;
     // the other one claimed it first.

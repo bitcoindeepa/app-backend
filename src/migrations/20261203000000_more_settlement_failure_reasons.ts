@@ -7,12 +7,15 @@ import type { Knex } from 'knex';
 const OLD = ['LOW_BALANCE', 'REJECTED', 'AUTH', 'UNKNOWN', 'APPROVAL_REJECTED'];
 const NEW = [...OLD, 'APPROVAL_DELIVERY', 'BUSY', 'OVER_LIMIT', 'NO_WALLET'];
 
+// NOT VALID: no scan of `transaction` under the exclusive lock while the old
+// release still serves. Every existing row passed the old, narrower CHECK, so
+// it passes this one; new and updated rows are checked as usual.
 const check = (values: string[]) => `
   ALTER TABLE "transaction"
     ADD CONSTRAINT transaction_settlement_failure_check CHECK (
       settlement_failure IS NULL OR settlement_failure IN
         (${values.map((v) => `'${v}'`).join(', ')})
-    )
+    ) NOT VALID
 `;
 
 export async function up(knex: Knex): Promise<void> {

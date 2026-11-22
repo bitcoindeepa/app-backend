@@ -250,6 +250,8 @@ describe('BitcoinDeepaService', () => {
         'BUSY',
       ],
       ['Amount cannot exceed 300,000 sats (Rs. 60,000)', 'OVER_LIMIT'],
+      ['Memo cannot exceed 280 characters', 'REJECTED'],
+      ['Daily total cannot exceed 1,000,000 sats', 'REJECTED'],
       ["Recipient '42' not found or has no wallet", 'NO_WALLET'],
       [
         'Insufficient balance: 10 sats available, 20 sats required',

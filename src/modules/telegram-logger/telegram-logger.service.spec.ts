@@ -241,6 +241,32 @@ describe('TelegramLoggerService log group limits', () => {
     expect(methods).toEqual(['sendRichMessage', 'sendMessage', 'sendMessage']);
   });
 
+  it('sends plain alerts for an hour after 3 rich refusals in a row', async () => {
+    jest.useFakeTimers({ now: 1_000_000 });
+    const service = new TelegramLoggerService();
+    const badHtml = () =>
+      Promise.resolve({
+        ok: false,
+        status: 400,
+        json: () => Promise.resolve({ ok: false, description: 'Bad HTML' }),
+      });
+    // rich refused, plain sent - three times
+    for (let i = 0; i < 3; i++) {
+      fetchMock.mockImplementationOnce(badHtml).mockImplementationOnce(ok);
+      await service.logAlert('S', `alert ${i}`);
+    }
+    const method = (i: number) =>
+      String((fetchMock.mock.calls[i] as [string])[0])
+        .split('/')
+        .pop();
+    await service.logAlert('S', 'during the pause');
+    expect(method(6)).toBe('sendMessage'); // no rich try
+
+    jest.setSystemTime(1_000_000 + 61 * 60_000);
+    await service.logAlert('S', 'after the pause');
+    expect(method(7)).toBe('sendRichMessage');
+  });
+
   it('a 429 on a reaction delays a later alert instead of losing it', async () => {
     jest.useFakeTimers({ now: 1_000_000 });
     const service = new TelegramLoggerService();

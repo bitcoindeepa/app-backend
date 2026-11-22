@@ -17,6 +17,9 @@ const ROUTINE_MESSAGES_PER_MINUTE = 15;
 const ALL_MESSAGES_PER_MINUTE = 19;
 /** A 429 without retry_after (body or header): pause this long */
 const DEFAULT_RETRY_AFTER_SECONDS = 30;
+/** Rich alerts refused in a row before alerts go plain for RICH_PAUSE_MS */
+const RICH_REFUSALS_BEFORE_PAUSE = 3;
+const RICH_PAUSE_MS = 60 * 60_000;
 /** Alerts held while rate limited, sent when the pause ends */
 const MAX_QUEUED_ALERTS = 20;
 
@@ -66,8 +69,14 @@ export class TelegramLoggerService {
   private recentSends: number[] = [];
   private warnedNotConfigured = false;
   private queuedAlerts: Alert[] = [];
-  /** Set when the Bot API doesn't know sendRichMessage (404): plain alerts only */
-  private richUnsupported = false;
+  /**
+   * Plain alerts only until then: for good after a 404 (the Bot API has no
+   * sendRichMessage), for an hour after RICH_REFUSALS_BEFORE_PAUSE refusals
+   * in a row (rich HTML wrong in a systematic way), so a burst of alerts
+   * doesn't spend two calls each against the group's rate limit
+   */
+  private richOffUntil = 0;
+  private richRefusalsInARow = 0;
   private flushTimer: NodeJS.Timeout | null = null;
   /** A drain is sending the queue: no second one may start */
   private draining = false;
@@ -173,7 +182,7 @@ export class TelegramLoggerService {
    * but a rate limit (that is retried as is, from the queue).
    */
   private async sendAlert(alert: Alert): Promise<CallResult> {
-    if (!this.richUnsupported && !alert.richRefused) {
+    if (Date.now() >= this.richOffUntil && !alert.richRefused) {
       const rich = await this.callLogGroup(
         'sendRichMessage',
         {
@@ -182,12 +191,19 @@ export class TelegramLoggerService {
         },
         true,
       );
+      if (rich.ok) this.richRefusalsInARow = 0;
       if (rich.ok || rich.limited) return rich;
       alert.richRefused = true;
       if (rich.status === 404) {
-        this.richUnsupported = true;
+        this.richOffUntil = Infinity;
         this.logger.warn(
           'Telegram has no sendRichMessage here: sending plain alerts from now on',
+        );
+      } else if (++this.richRefusalsInARow >= RICH_REFUSALS_BEFORE_PAUSE) {
+        this.richRefusalsInARow = 0;
+        this.richOffUntil = Date.now() + RICH_PAUSE_MS;
+        this.logger.warn(
+          `Telegram refused ${RICH_REFUSALS_BEFORE_PAUSE} rich alerts in a row: plain alerts for the next hour`,
         );
       }
     }

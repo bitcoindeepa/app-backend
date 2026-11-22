@@ -231,7 +231,8 @@ export class ReviewReminderService {
       .orderBy('last_retry_at')
       .limit(LISTED_PER_GROUP);
     return {
-      heading: `Paid but not settled after ${MAX_SETTLEMENT_ATTEMPTS} attempts`,
+      // Refusals retrying can't fix stop after one attempt: the Reason says why
+      heading: 'Paid but not settled (retries stopped)',
       hint: 'check PayHere and BitcoinDeepa before POST /transaction/reset-retry-count/<id>',
       total: await this.count(query()),
       lines: rows.map(

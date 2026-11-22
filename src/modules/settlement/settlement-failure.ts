@@ -37,7 +37,7 @@ const FAILURE_HINTS: Record<SettlementFailure, string> = {
   LOW_BALANCE: 'top up our sending wallet',
   APPROVAL_DELIVERY:
     "the bot couldn't DM the approval request: check our sending wallet owner's chat with the bot",
-  BUSY: 'the bot was still processing this send',
+  BUSY: 'the bot was still processing a send with this memo: check the bot history for it before resetting',
   OVER_LIMIT: "above the bot's per-transfer max for our sending wallet",
   NO_WALLET: "the bot doesn't know the recipient's (or our) wallet",
   REJECTED: 'the bot refused it: see the "Settlement of <id>" logs',

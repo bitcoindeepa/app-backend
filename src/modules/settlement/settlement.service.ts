@@ -410,7 +410,19 @@ export class SettlementService {
         return;
       }
 
-      await this.recordFailure(payhere_pay_id, currentRetryCount, result);
+      const recorded = await this.recordFailure(
+        payhere_pay_id,
+        currentRetryCount,
+        result,
+      );
+      if (!recorded) {
+        // A reset or a newer attempt changed the row during the send: its
+        // state is theirs now, so don't report this one as stopped
+        this.logger.warn(
+          `Settlement of ${payhere_pay_id} failed (${result.failure ?? 'REJECTED'}: ${result.message}), but the payment changed meanwhile; nothing recorded`,
+        );
+        return;
+      }
       if (result.failure === 'AUTH') {
         await this.alertAuthFailure(result);
       }
@@ -485,15 +497,15 @@ export class SettlementService {
   /**
    * Remember why the send failed (LOW_BALANCE rows are retried by the bot's
    * deposit callback). Only for our own attempt, so a stale writer can't
-   * overwrite a newer attempt's state.
+   * overwrite a newer attempt's state. False when the row had moved on.
    */
   private async recordFailure(
     payhere_pay_id: string,
     attempt: number,
     result: FundTransferResponse,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const failure = result.failure ?? 'REJECTED';
-    await this.knexService
+    const updated = await this.knexService
       .knex('transaction')
       .update({
         settlement_failure: failure,
@@ -505,6 +517,7 @@ export class SettlementService {
       })
       .where('payhere_pay_id', payhere_pay_id)
       .where('retry_count', attempt);
+    return updated > 0;
   }
 
   /**
@@ -789,7 +802,7 @@ export class SettlementService {
   /**
    * Whether an earlier send may have gone through, so the bot history is
    * checked before sending. UNKNOWN is recorded by this release (timeout or
-   * 5xx). An attempt with no recorded outcome counts too: the previous
+   * 5xx); BUSY means a send with this memo was still running at the bot. An attempt with no recorded outcome counts too: the previous
    * release recorded none and gave up on /send after 10s (it also settles
    * this release's rows while both run during a deploy, with its own memo),
    * and a crash mid-send leaves none.
@@ -799,6 +812,7 @@ export class SettlementService {
   ): boolean {
     return (
       transaction.settlement_failure === 'UNKNOWN' ||
+      transaction.settlement_failure === 'BUSY' ||
       (!transaction.settlement_failure && (transaction.retry_count ?? 0) > 0)
     );
   }

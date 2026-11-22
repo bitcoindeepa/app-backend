@@ -161,7 +161,9 @@ export interface SendStatusResponse {
 const REFUSAL_PATTERNS: [RegExp, TransferFailure][] = [
   [/could not deliver the approval request/i, 'APPROVAL_DELIVERY'],
   [/is already processing/i, 'BUSY'],
-  [/cannot exceed/i, 'OVER_LIMIT'],
+  // Only the per-transfer max: other "... cannot exceed" refusals (the memo
+  // length, any limit that clears with time) stay REJECTED and are retried
+  [/^amount cannot exceed/i, 'OVER_LIMIT'],
   [/not found or has no wallet/i, 'NO_WALLET'],
   [/insufficient|low balance|not enough|balance too low/i, 'LOW_BALANCE'],
 ];
