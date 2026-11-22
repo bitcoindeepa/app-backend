@@ -593,6 +593,63 @@ describe('Settlement (e2e)', () => {
     alert.mockRestore();
   });
 
+  it('stops at once and alerts when retrying cannot help (over the bot limit)', async () => {
+    const alert = jest.spyOn(ctx.app.get(TelegramLoggerService), 'logAlert');
+    ctx.bitcoinDeepa.transferFunds.mockResolvedValueOnce({
+      success: false,
+      failure: 'OVER_LIMIT',
+      message: 'Amount cannot exceed 300,000 sats',
+    });
+
+    await settlement.retryUnsettledTransactions();
+    expect(await tx()).toMatchObject({
+      settled: false,
+      retry_count: 5,
+      settlement_failure: 'OVER_LIMIT',
+    });
+    expect(alert).toHaveBeenCalledWith(
+      'Settlement',
+      expect.stringContaining("Retrying won't help"),
+    );
+
+    await ctx
+      .knex('transaction')
+      .where({ payhere_pay_id: 'P1' })
+      .update({ last_retry_at: new Date(0) });
+    await settlement.retryUnsettledTransactions();
+    expect(ctx.bitcoinDeepa.transferFunds).toHaveBeenCalledTimes(1);
+    alert.mockRestore();
+  });
+
+  it('retries a passing refusal (approval DM not delivered) on the slower schedule', async () => {
+    ctx.bitcoinDeepa.transferFunds.mockResolvedValueOnce({
+      success: false,
+      failure: 'APPROVAL_DELIVERY',
+      message: 'Could not deliver the approval request via Telegram.',
+    });
+    await settlement.retryUnsettledTransactions();
+    expect(await tx()).toMatchObject({
+      retry_count: 1,
+      settlement_failure: 'APPROVAL_DELIVERY',
+    });
+    const attemptedAgo = (minutes: number) =>
+      ctx
+        .knex('transaction')
+        .where({ payhere_pay_id: 'P1' })
+        .update({
+          last_retry_at: ctx.knex.raw(`now() - interval '${minutes} minutes'`),
+        });
+
+    // 2^1 = 2 minutes would be due, but this one waits 4^1 = 4
+    await attemptedAgo(3);
+    await settlement.retryUnsettledTransactions();
+    expect(ctx.bitcoinDeepa.transferFunds).toHaveBeenCalledTimes(1);
+
+    await attemptedAgo(5);
+    await settlement.retryUnsettledTransactions();
+    expect(ctx.bitcoinDeepa.transferFunds).toHaveBeenCalledTimes(2);
+  });
+
   it('a stale snapshot (row already claimed by another run) does not transfer', async () => {
     // Simulates two instances that both loaded the row at retry_count 0;
     // the other one claimed it first.

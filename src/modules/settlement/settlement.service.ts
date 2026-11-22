@@ -12,6 +12,12 @@ import { RedisService } from '../redis/redis.service';
 import { errorMessage } from '../../common/error-message';
 import { legacyTransferMemo, transferMemo } from './transfer-memo';
 import {
+  NEEDS_HUMAN_FAILURES,
+  RETRY_LATER_FAILURES,
+  describeFailure,
+  retryDelayMinutes,
+} from './settlement-failure';
+import {
   MAX_SETTLEMENT_ATTEMPTS,
   sameAmount,
   type PurchaseKind,
@@ -75,7 +81,8 @@ export class SettlementService {
 
     try {
       // Backoff is filtered in SQL: retry n waits 2^n minutes after the last
-      // attempt, so rows still in backoff are never loaded (or logged).
+      // attempt (4^n after a passing refusal, see retryDelayMinutes), so rows
+      // still in backoff are never loaded (or logged).
       const unsettledTransactions: UnsettledTransaction[] =
         await this.knexService
           .knex('transaction as t')
@@ -109,7 +116,8 @@ export class SettlementService {
             void qb
               .whereNull('t.last_retry_at')
               .orWhereRaw(
-                "t.last_retry_at + (power(2, t.retry_count) * interval '1 minute') <= now()",
+                `t.last_retry_at + (power(CASE WHEN t.settlement_failure IN (${RETRY_LATER_FAILURES.map(() => '?').join(', ')}) THEN 4 ELSE 2 END, t.retry_count) * interval '1 minute') <= now()`,
+                [...RETRY_LATER_FAILURES],
               );
           });
 
@@ -406,14 +414,27 @@ export class SettlementService {
       if (result.failure === 'AUTH') {
         await this.alertAuthFailure(result);
       }
+      const failure = result.failure ?? 'REJECTED';
 
-      if (currentRetryCount >= MAX_SETTLEMENT_ATTEMPTS) {
-        const alert = `Settlement of ${payhere_pay_id} permanently failed after ${currentRetryCount} attempts: ${result.message}`;
+      if (NEEDS_HUMAN_FAILURES.includes(failure)) {
+        // Retrying can't help (over the bot's limit, unknown wallet): use up
+        // the attempts so it waits for a human, and say so now, not after
+        // five identical refusals. Guarded on our own attempt.
+        await this.knexService
+          .knex('transaction')
+          .update({ retry_count: MAX_SETTLEMENT_ATTEMPTS })
+          .where('payhere_pay_id', payhere_pay_id)
+          .where('retry_count', currentRetryCount);
+        const alert = `Settlement of ${payhere_pay_id} (${satoshis_purchased} sats to user ${telegram_id}) stopped: ${describeFailure(failure)}. The bot said: ${result.message}. Retrying won't help - fix it, then POST /transaction/reset-retry-count/${payhere_pay_id}.`;
+        this.logger.error(alert);
+        await this.telegramLogger.logAlert('Settlement', alert);
+      } else if (currentRetryCount >= MAX_SETTLEMENT_ATTEMPTS) {
+        const alert = `Settlement of ${payhere_pay_id} permanently failed after ${currentRetryCount} attempts: ${describeFailure(failure)}. The bot said: ${result.message}`;
         this.logger.error(alert);
         await this.telegramLogger.logAlert('Settlement', alert);
       } else {
         this.logger.warn(
-          `Settlement of ${payhere_pay_id} failed (attempt ${currentRetryCount}/${MAX_SETTLEMENT_ATTEMPTS}): ${result.message}. Next retry in ${Math.pow(2, currentRetryCount)} minutes.`,
+          `Settlement of ${payhere_pay_id} failed (attempt ${currentRetryCount}/${MAX_SETTLEMENT_ATTEMPTS}, ${failure}): ${result.message}. Next retry in ${retryDelayMinutes(failure, currentRetryCount)} minutes.`,
         );
       }
     } catch (error) {

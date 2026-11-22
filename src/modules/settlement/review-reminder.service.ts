@@ -7,6 +7,7 @@ import { TelegramLoggerService } from '../telegram-logger/telegram-logger.servic
 import { errorMessage } from '../../common/error-message';
 import { SellStatus } from '../sell/sell.constants';
 import { MAX_SETTLEMENT_ATTEMPTS } from '../transaction/transaction.service';
+import { describeFailure } from './settlement-failure';
 
 /** How often the reminder goes out while anything is waiting */
 export const REMINDER_INTERVAL_HOURS = 3;
@@ -182,7 +183,9 @@ export class ReviewReminderService {
       lines: rows.map(
         (row) =>
           `${row.payhere_pay_id}: ${num(row.satoshis_purchased)} sats, #UID${row.user_id ?? '?'}` +
-          (row.settlement_failure ? ` - ${row.settlement_failure}` : ''),
+          (row.settlement_failure
+            ? ` - ${describeFailure(row.settlement_failure)}`
+            : ''),
       ),
     };
   }
