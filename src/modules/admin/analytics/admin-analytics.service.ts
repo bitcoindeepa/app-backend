@@ -69,11 +69,12 @@ export class AdminAnalyticsService {
           coalesce(sum(gross_amount) filter (where settled), 0) as gross,
           coalesce(sum(net_amount) filter (where settled), 0) as net,
           coalesce(sum(bitcoindeepa_fee_amount) filter (where settled), 0) as bitcoindeepa_fees,
-          coalesce(sum(satoshis_purchased) filter (where settled), 0) as satoshis,
+          -- sats sent: purchases plus first-timer bonuses
+          coalesce(sum(satoshis_purchased + coalesce(bonus_satoshis, 0)) filter (where settled), 0) as satoshis,
           coalesce(sum(gross_amount) filter (where settled and created_at >= now() - interval '30 days'), 0) as gross_30d,
           count(*) filter (where not settled) as unsettled,
           coalesce(sum(gross_amount) filter (where not settled), 0) as unsettled_gross,
-          coalesce(sum(satoshis_purchased) filter (where not settled), 0) as unsettled_satoshis
+          coalesce(sum(satoshis_purchased + coalesce(bonus_satoshis, 0)) filter (where not settled), 0) as unsettled_satoshis
         from "transaction"
         where status = 'SUCCESS'
       ) p

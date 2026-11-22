@@ -338,6 +338,15 @@ class EnvironmentVariables {
   @Max(900)
   EXCHANGE_RATE_FALLBACK_MAX_AGE_SECONDS?: number;
 
+  // Bonus sats worth this many LKR on a member's first successful payment
+  // (src/common/first-timer-reward.ts). Unset or 0 = off. Capped so a typo
+  // can't give away a fortune per member.
+  @IsOptional()
+  @IsNumber({ maxDecimalPlaces: 2 })
+  @Min(0)
+  @Max(10_000)
+  FIRST_TIMER_REWARD_LKR?: number;
+
   // Sell flow (CeyPay aggregator off-ramp). Off unless SELL_ENABLED=true:
   // the sell and bank-account endpoints answer 503 and its crons don't run.
   @IsOptional()

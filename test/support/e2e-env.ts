@@ -63,6 +63,9 @@ if (fs.existsSync(envFile)) {
 // nothing real is called - the tests stub those services anyway.
 Object.assign(process.env, {
   NODE_ENV: 'test',
+  // Off unless a test opts in (test/first-timer-reward.e2e-spec.ts), so a
+  // value copied into .env can't change other suites' settlement amounts
+  FIRST_TIMER_REWARD_LKR: '0',
   DATABASE_URL: testDb,
   // the analytics migration grants on the database by name
   PG_DB: new URL(testDb).pathname.slice(1),

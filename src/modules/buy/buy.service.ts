@@ -35,6 +35,8 @@ export interface BuyOrderView {
   status: BuyOrderStatus;
   payhere_pay_id: string | null;
   satoshis: number | null;
+  /** First-timer reward sent with this purchase (null = none) */
+  bonus_satoshis: number | null;
   settled: boolean;
   /** Paid, but held for a manual check before the sats are sent */
   held: boolean;
@@ -219,6 +221,7 @@ export class BuyService {
       payhere_pay_id: string;
       status: Status;
       satoshis_purchased: string | null;
+      bonus_satoshis: string | null;
       settled: boolean;
       hold_reason: string | null;
       created_at: Date;
@@ -227,6 +230,7 @@ export class BuyService {
         'payhere_pay_id',
         'status',
         'satoshis_purchased',
+        'bonus_satoshis',
         'settled',
         'hold_reason',
       )
@@ -242,6 +246,8 @@ export class BuyService {
       status: tx?.status ?? 'AWAITING_PAYMENT',
       payhere_pay_id: tx?.payhere_pay_id ?? null,
       satoshis: toApiNumberOrNull(tx?.satoshis_purchased),
+      // First-timer reward sent with this purchase (null = none)
+      bonus_satoshis: toApiNumberOrNull(tx?.bonus_satoshis),
       settled: tx?.settled ?? false,
       // The reason is for the team, not the member
       held: !!tx?.hold_reason && !tx.settled,
