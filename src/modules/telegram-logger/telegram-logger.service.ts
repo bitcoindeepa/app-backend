@@ -17,6 +17,8 @@ const ROUTINE_MESSAGES_PER_MINUTE = 15;
 const ALL_MESSAGES_PER_MINUTE = 19;
 /** A 429 without retry_after (body or header): pause this long */
 const DEFAULT_RETRY_AFTER_SECONDS = 30;
+/** Routine logs link profiles (t.me): no preview cards in the group */
+const NO_LINK_PREVIEW = { is_disabled: true };
 /** Alerts held while rate limited, sent when the pause ends */
 const MAX_QUEUED_ALERTS = 20;
 
@@ -52,8 +54,20 @@ export class TelegramLoggerService {
     this.alertTopicId = process.env.ALERT_TOPIC_ID || this.logTopicId;
   }
 
-  private formatUsername(user: JwtPayload): string {
-    return user.username ? `@${user.username}` : 'Unknown';
+  /**
+   * Who did it, without ever mentioning anyone: no "@", so Telegram makes no
+   * mention and notifies nobody (an app username can even be someone else's
+   * Telegram name). The Telegram username links to their profile (t.me is a
+   * plain link, not a mention); the app username is code text.
+   */
+  private formatUser(user: JwtPayload): string {
+    const tg = user.tgUsername
+      ? `<a href="https://t.me/${encodeURIComponent(user.tgUsername)}">${escapeHtml(user.tgUsername)}</a>`
+      : 'none';
+    const app = user.username
+      ? `<code>${escapeHtml(user.username)}</code>`
+      : 'not set';
+    return `Telegram: ${tg}\nApp user: ${app}\nUser ID: <b>#UID${user.id}</b>`;
   }
 
   async logNewTransaction(
@@ -225,10 +239,7 @@ export class TelegramLoggerService {
     action: string,
     user: JwtPayload,
   ): Promise<TgMessage | null> {
-    const message =
-      `Action: <b>${action}</b>\n` +
-      `Username: <b>${this.formatUsername(user)}</b>\n` +
-      `User ID: <b>#UID${user.id}</b>`;
+    const message = `Action: <b>${action}</b>\n` + this.formatUser(user);
     return await this.sendMessage(message);
   }
 
@@ -258,6 +269,7 @@ export class TelegramLoggerService {
       message_id: message.id.toString(),
       text,
       parse_mode: 'HTML',
+      link_preview_options: NO_LINK_PREVIEW,
     });
     if (outcome.ok) message.text = text;
   }
@@ -391,7 +403,7 @@ export class TelegramLoggerService {
     if (!this.isConfigured()) return null;
     const outcome = await this.callLogGroup(
       'sendMessage',
-      { text, parse_mode: 'HTML' },
+      { text, parse_mode: 'HTML', link_preview_options: NO_LINK_PREVIEW },
       priority,
     );
     if (!outcome.ok) return null;

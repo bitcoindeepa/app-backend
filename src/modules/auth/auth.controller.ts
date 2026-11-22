@@ -128,6 +128,7 @@ export class AuthController {
         id: telegramId,
         first_name: claims.given_name || claims.name || 'Telegram User',
         last_name: claims.family_name,
+        tg_username: claims.preferred_username,
       });
       await this.userService.setTelegramSub(telegramId, claims.sub);
       await this.linkWallet(
@@ -175,6 +176,7 @@ export class AuthController {
       id: telegramId,
       first_name: userData.first_name || 'Telegram User',
       last_name: userData.last_name,
+      tg_username: userData.username,
     });
     const link = await this.linkWallet(
       telegramId,
@@ -371,6 +373,7 @@ export class AuthController {
       id: telegramId,
       first_name: firstName || 'Telegram User',
       last_name: lastName,
+      tg_username: username,
     });
     const payload: JwtPayload = { id: telegramId, username };
     return {

@@ -40,20 +40,15 @@ export class SubscriptionController {
   async getCurrentSubscription(
     @CurrentUser() user: JwtPayload,
   ): Promise<SubscriptionDetails> {
-    return this.telegramLoggerService.trackAction(
-      'Current Subscription (/subscription/current)',
-      user,
-      async () => {
-        const subscription =
-          await this.subscriptionService.getCurrentSubscriptionDetailsForUser(
-            user.id,
-          );
-        if (!subscription) {
-          throw new NotFoundException('Subscription not found');
-        }
-        return subscription;
-      },
-    );
+    // Read-only: not logged to the ops group (page loads drown real actions)
+    const subscription =
+      await this.subscriptionService.getCurrentSubscriptionDetailsForUser(
+        user.id,
+      );
+    if (!subscription) {
+      throw new NotFoundException('Subscription not found');
+    }
+    return subscription;
   }
 
   @Post('payhere-link')

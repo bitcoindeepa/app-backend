@@ -16,10 +16,18 @@ const APP = 'https://app.example.test';
 const CLIENT_ID = '8219648988';
 
 /** Mini App initData signed the way Telegram does */
-function signedInitData(userId = USER, ageSeconds = 5): string {
+function signedInitData(
+  userId = USER,
+  ageSeconds = 5,
+  tgUsername?: string,
+): string {
   const fields = {
     auth_date: String(Math.floor(Date.now() / 1000) - ageSeconds),
-    user: JSON.stringify({ id: Number(userId), first_name: 'Mini' }),
+    user: JSON.stringify({
+      id: Number(userId),
+      first_name: 'Mini',
+      ...(tgUsername ? { username: tgUsername } : {}),
+    }),
   };
   const dcs = Object.entries(fields)
     .map(([k, v]) => `${k}=${v}`)
@@ -136,6 +144,36 @@ describe('User sessions (e2e)', () => {
       );
     });
 
+    it('keeps the Telegram username as Telegram sends it', async () => {
+      const tgUsername = async () =>
+        (
+          await ctx.knex('user').where({ id: USER }).first<{
+            tg_username: string | null;
+          }>()
+        ).tg_username;
+      const login = (initData: string) =>
+        http()
+          .post('/auth/telegram/miniapp')
+          .send({ initData })
+          .expect(200)
+          .then((res) => res.body as { token: string });
+
+      // A completed profile stops name updates, but not this
+      await ctx.knex('user').where({ id: USER }).update({ email: 'a@b.c' });
+      const { token } = await login(signedInitData(USER, 5, 'Nimal_TG'));
+      expect(await tgUsername()).toBe('Nimal_TG');
+
+      // The request user carries it next to the app username (ops logs)
+      expect(await ctx.app.get(SessionService).validate(token)).toMatchObject({
+        id: USER,
+        tgUsername: 'Nimal_TG',
+      });
+
+      // Removed on Telegram: removed here
+      await login(signedInitData(USER));
+      expect(await tgUsername()).toBeNull();
+    });
+
     it('refuses initData older than 15 minutes, or a bad signature', async () => {
       await http()
         .post('/auth/telegram/miniapp')
@@ -205,6 +243,7 @@ describe('User sessions (e2e)', () => {
           id: USER,
           sub: 'sub-abc',
           given_name: 'Web',
+          preferred_username: 'web_tg_name',
           ...claims,
         } as TelegramOidcClaims);
       return { fetchSpy, verify };
@@ -285,6 +324,7 @@ describe('User sessions (e2e)', () => {
       expect(me.body.session.kind).toBe('web');
       expect(await ctx.knex('user').where({ id: USER }).first()).toMatchObject({
         telegram_sub: 'sub-abc',
+        tg_username: 'web_tg_name',
       });
     });
 

@@ -57,7 +57,13 @@ export type OidcRejection = 'missing_telegram_id' | 'invalid_id_token';
 
 export interface JwtPayload {
   id: string;
+  /**
+   * In a legacy 7-day JWT: the Telegram username. On the request user: the
+   * Bitcoin Deepa @username (sessions; the guard moves a JWT's to tgUsername)
+   */
   username?: string;
+  /** The Telegram username (request user only; logs) */
+  tgUsername?: string;
 }
 
 // Claims Telegram puts in the id_token — see

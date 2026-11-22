@@ -42,6 +42,7 @@ interface SessionRow {
   last_seen_at: Date;
   absolute_expires_at: Date;
   username: string | null;
+  tg_username: string | null;
 }
 
 export const hashToken = (token: string): Buffer =>
@@ -109,7 +110,7 @@ export class SessionService {
       .where('s.absolute_expires_at', '>', now)
       .first<
         SessionRow | undefined
-      >('s.id', 's.user_id', 's.kind', 's.last_seen_at', 's.absolute_expires_at', 'u.username');
+      >('s.id', 's.user_id', 's.kind', 's.last_seen_at', 's.absolute_expires_at', 'u.username', 'u.tg_username');
     if (!row) return null;
 
     const policy = SESSION_POLICY[row.kind];
@@ -135,6 +136,7 @@ export class SessionService {
     return {
       id: row.user_id,
       username: row.username ?? undefined,
+      tgUsername: row.tg_username ?? undefined,
       sessionId: row.id,
       sessionKind: row.kind,
     };
