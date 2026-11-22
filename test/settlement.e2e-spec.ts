@@ -851,6 +851,39 @@ describe('Settlement (e2e)', () => {
       alert.mockRestore();
     });
 
+    it('an attempt with no recorded outcome keeps that marker, so a later confirmed attempt still does not resend blind', async () => {
+      // The previous release (another memo) sent it and recorded nothing
+      await ctx
+        .knex('transaction')
+        .where({ payhere_pay_id: 'P1' })
+        .update({
+          retry_count: 1,
+          last_retry_at: new Date(0),
+          settlement_failure: null,
+        });
+
+      // Not listed by PayHere yet, bot history unreadable
+      ctx.payHerePayments.mockResolvedValueOnce([]);
+      ctx.payHereOrderPayments.mockResolvedValueOnce([]);
+      ctx.bitcoinDeepa.findSettlementTransfer.mockResolvedValueOnce(null);
+      await settlement.retryUnsettledTransactions();
+      expect(ctx.bitcoinDeepa.transferFunds).not.toHaveBeenCalled();
+      expect(await tx()).toMatchObject({
+        settled: false,
+        settlement_failure: null,
+      });
+
+      // Next attempt: PayHere confirms it, bot history still unreadable
+      await ctx
+        .knex('transaction')
+        .where({ payhere_pay_id: 'P1' })
+        .update({ last_retry_at: new Date(0) });
+      ctx.bitcoinDeepa.findSettlementTransfer.mockResolvedValueOnce(null);
+      await settlement.retryUnsettledTransactions();
+      expect(ctx.bitcoinDeepa.transferFunds).not.toHaveBeenCalled();
+      expect(await tx()).toMatchObject({ settled: false });
+    });
+
     it('an earlier send with no answer not found in the history: stays UNKNOWN, last attempt says it may have gone out', async () => {
       const alert = jest.spyOn(ctx.app.get(TelegramLoggerService), 'logAlert');
       await earlierAttempt('UNKNOWN');

@@ -49,6 +49,8 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
           open=$(gh pr list --head "$BRANCH" --base dev --state open --json number --jq '.[0].number // empty')
+          # Before anything below can exit: the next step must skip creating an open PR
+          echo "open=$open" >> "$GITHUB_ENV"
           if [ -n "$open" ] && git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null; then
             # An open PR may already hold a conflict resolution: add main on top, never reset it.
             git checkout -B "$BRANCH" "origin/$BRANCH"
@@ -62,7 +64,6 @@ jobs:
             # No open PR: start the branch at main, so the PR shows exactly what dev is missing.
             git push --force origin "origin/main:refs/heads/$BRANCH"
           fi
-          echo "open=$open" >> "$GITHUB_ENV"
 
       - name: Open the PR
         if: steps.diff.outputs.count != '0' && env.open == ''
