@@ -163,6 +163,7 @@ bun run test:e2e        # e2e against a disposable Postgres/Redis (see test/READ
 - Jest + `@nestjs/testing` + supertest. E2E boots the real `AppModule` via `configureApp()` (`src/app.setup.ts`, shared with `main.ts`) and stubs external services in `test/support/test-app.ts`.
 - E2E tests truncate tables and refuse to run against the `.env` database. Put new unit tests next to the code (`*.spec.ts`), new flows in `test/*.e2e-spec.ts`.
 - CI: `.github/workflows/test.yml` runs tsc, unit and e2e (Postgres + Redis services) on every PR.
+- Branches: features go to `dev`; hotfixes go to `main`. Every push to `main` makes `.github/workflows/backmerge.yml` open (or update) a `backmerge/main-into-dev` PR into `dev`: merge it with a merge commit, and resolve conflicts on that branch keeping every check from `main`. Set the `BACKMERGE_TOKEN` secret so CI runs on that PR automatically.
 
 ### Development Commands
 ```bash

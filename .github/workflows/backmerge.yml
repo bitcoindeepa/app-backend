@@ -1,0 +1,72 @@
+name: back-merge main into dev
+
+# Every push to main (a hotfix or a release) opens, or updates, a PR that
+# merges main into dev, so the two branches stop drifting apart (#81).
+#
+# Resolve conflicts on the PR branch (merge dev into it), keeping every check
+# from main's side. Merge the PR with a merge commit, not a squash.
+#
+# PRs and pushes made with the default GITHUB_TOKEN don't start other
+# workflows, so test.yml won't run on the PR by itself. Set the
+# BACKMERGE_TOKEN secret (a fine-grained PAT or GitHub App token with
+# contents + pull-requests write on this repo) to get CI automatically;
+# without it, push any commit to the branch to start CI.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: backmerge
+  cancel-in-progress: false
+
+jobs:
+  backmerge:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.BACKMERGE_TOKEN || github.token }}
+      BRANCH: backmerge/main-into-dev
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.BACKMERGE_TOKEN || github.token }}
+
+      - name: Anything on main that dev lacks?
+        id: diff
+        run: |
+          count=$(git rev-list --count origin/dev..origin/main)
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "$count commit(s) on main not on dev"
+
+      - name: Update the back-merge branch
+        if: steps.diff.outputs.count != '0'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          open=$(gh pr list --head "$BRANCH" --base dev --state open --json number --jq '.[0].number // empty')
+          if [ -n "$open" ] && git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null; then
+            # An open PR may already hold a conflict resolution: add main on top, never reset it.
+            git checkout -B "$BRANCH" "origin/$BRANCH"
+            if ! git merge --no-edit origin/main; then
+              git merge --abort
+              gh pr comment "$open" --body "main moved (\`$(git rev-parse --short origin/main)\`) and doesn't merge cleanly into this branch: merge \`main\` into \`$BRANCH\` by hand."
+              exit 0
+            fi
+            git push origin "$BRANCH"
+          else
+            # No open PR: start the branch at main, so the PR shows exactly what dev is missing.
+            git push --force origin "origin/main:refs/heads/$BRANCH"
+          fi
+          echo "open=$open" >> "$GITHUB_ENV"
+
+      - name: Open the PR
+        if: steps.diff.outputs.count != '0' && env.open == ''
+        run: |
+          commits=$(git log --format='- %s' origin/dev..origin/main)
+          body=$(printf 'Automatic back-merge of the commits on `main` that `dev` does not have:\n\n%s\n\nMerge with a merge commit (not squash), so the next `dev -> main` release does not conflict on them again. If it conflicts, merge `dev` into `%s` and resolve there, keeping every check from `main`.' "$commits" "$BRANCH")
+          gh pr create --base dev --head "$BRANCH" --title "Back-merge main into dev" --body "$body"
