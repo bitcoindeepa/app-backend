@@ -121,7 +121,10 @@ export class UserService {
       // billing), stop overwriting it with their Telegram display name.
       .whereNull('user.email');
     // The Telegram username follows Telegram on every login, profile or not
-    // (a rename, or removing it, clears the old one)
+    // (a rename, or removing it, clears the old one). A separate statement on
+    // purpose: the insert above covers new users, but its merge() stops at
+    // the whereNull('user.email') guard, so for members with a completed
+    // profile only this one updates it. Don't fold it into the merge.
     await this.knexService
       .knex('user')
       .where('id', profile.id)

@@ -63,7 +63,9 @@ export class TelegramLoggerService {
   private formatUser(user: JwtPayload): string {
     const tg = user.tgUsername
       ? `<a href="https://t.me/${encodeURIComponent(user.tgUsername)}">${escapeHtml(user.tgUsername)}</a>`
-      : 'none';
+      : // Null when they have no Telegram username, or haven't logged in
+        // since tg_username was added: "unknown" is true in both cases
+        'unknown';
     const app = user.username
       ? `<code>${escapeHtml(user.username)}</code>`
       : 'not set';

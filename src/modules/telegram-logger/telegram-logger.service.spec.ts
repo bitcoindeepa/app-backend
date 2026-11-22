@@ -95,7 +95,7 @@ describe('TelegramLoggerService routine logs', () => {
 
   it('says so when either name is missing', async () => {
     await new TelegramLoggerService().logGenericAction('Buy', { id: '42' });
-    expect(sent().text).toContain('Telegram: none\nApp user: not set');
+    expect(sent().text).toContain('Telegram: unknown\nApp user: not set');
   });
 });
 
