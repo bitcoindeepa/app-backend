@@ -5,6 +5,7 @@ import { KnexService } from '../knex/knex.service';
 import { RedisService } from '../redis/redis.service';
 import { TelegramLoggerService } from '../telegram-logger/telegram-logger.service';
 import { errorMessage } from '../../common/error-message';
+import { escapeHtml } from '../../common/escape-html';
 import { SellStatus } from '../sell/sell.constants';
 import { MAX_SETTLEMENT_ATTEMPTS } from '../transaction/transaction.service';
 import { describeFailure } from './settlement-failure';
@@ -24,9 +25,41 @@ const BUY_MAX_AGE_DAYS = 7;
 const LISTED_PER_GROUP = 8;
 
 interface Group {
-  title: string;
+  /** Short name, the rich message's section heading */
+  heading: string;
+  /** What to do about it */
+  hint: string;
   total: number;
+  /** One per listed row, for the plain text */
   lines: string[];
+  /** The same rows as table cells, for the rich message */
+  columns: string[];
+  rows: string[][];
+}
+
+const cell = (tag: 'th' | 'td', value: string) =>
+  `<${tag}>${escapeHtml(value)}</${tag}>`;
+
+/** The reminder as a rich message: per group a heading, the hint and a table */
+function richReminder(total: number, groups: Group[]): string {
+  return [
+    `<p><b>${total} item(s)</b> still waiting for a human.</p>`,
+    ...groups.map((group) => {
+      const more = group.total - group.rows.length;
+      return [
+        `<h4>${escapeHtml(group.heading)} (${group.total})</h4>`,
+        `<p>${escapeHtml(group.hint)}</p>`,
+        '<table bordered striped compact>',
+        `<tr>${group.columns.map((c) => cell('th', c)).join('')}</tr>`,
+        ...group.rows.map(
+          (row) => `<tr>${row.map((v) => cell('td', v)).join('')}</tr>`,
+        ),
+        '</table>',
+        ...(more > 0 ? [`<p>and ${more} more</p>`] : []),
+      ].join('');
+    }),
+    `<footer>Repeated every ${REMINDER_INTERVAL_HOURS}h while anything waits</footer>`,
+  ].join('');
 }
 
 const num = (value: string | number) => Number(value).toLocaleString('en-US');
@@ -77,13 +110,17 @@ export class ReviewReminderService {
         ...groups.map((group) => {
           const more = group.total - group.lines.length;
           return [
-            `\n${group.title} (${group.total}):`,
+            `\n${group.heading} (${group.hint}) (${group.total}):`,
             ...group.lines.map((line) => `- ${line}`),
             ...(more > 0 ? [`- and ${more} more`] : []),
           ].join('\n');
         }),
       ].join('\n');
-      await this.telegramLogger.logAlert('Waiting for review', text);
+      await this.telegramLogger.logAlert(
+        'Waiting for review',
+        text,
+        richReminder(total, groups),
+      );
     } catch (error) {
       this.logger.error(`Review reminder failed: ${errorMessage(error)}`);
     }
@@ -110,13 +147,22 @@ export class ReviewReminderService {
       .orderBy('updated_at')
       .limit(LISTED_PER_GROUP);
     return {
-      title: 'Sales in NEEDS_REVIEW (sats collected, check before refunding)',
+      heading: 'Sales in NEEDS_REVIEW',
+      hint: 'sats collected, check before refunding',
       total: await this.count(query()),
       lines: rows.map(
         (row) =>
           `${row.id}: ${num(row.sats)} sats for ${row.amount_lkr} LKR, #UID${row.user_id}` +
           (row.failure_reason ? ` - ${row.failure_reason}` : ''),
       ),
+      columns: ['Order', 'Sats', 'LKR', 'User', 'Reason'],
+      rows: rows.map((row) => [
+        row.id,
+        num(row.sats),
+        row.amount_lkr,
+        `#UID${row.user_id}`,
+        row.failure_reason ?? '',
+      ]),
     };
   }
 
@@ -140,13 +186,20 @@ export class ReviewReminderService {
       .orderBy('created_at')
       .limit(LISTED_PER_GROUP);
     return {
-      title:
-        'Held one-time buys (POST /transaction/release-hold/<id>, or refund in PayHere)',
+      heading: 'Held one-time buys',
+      hint: 'POST /transaction/release-hold/<id>, or refund in PayHere',
       total: await this.count(query()),
       lines: rows.map(
         (row) =>
           `${row.payhere_pay_id}: ${row.gross_amount ?? '?'} LKR, #UID${row.user_id ?? '?'} - ${row.hold_reason}`,
       ),
+      columns: ['Payment', 'LKR', 'User', 'Reason'],
+      rows: rows.map((row) => [
+        row.payhere_pay_id,
+        row.gross_amount ?? '?',
+        `#UID${row.user_id ?? '?'}`,
+        row.hold_reason,
+      ]),
     };
   }
 
@@ -178,7 +231,8 @@ export class ReviewReminderService {
       .orderBy('last_retry_at')
       .limit(LISTED_PER_GROUP);
     return {
-      title: `Paid but not settled after ${MAX_SETTLEMENT_ATTEMPTS} attempts (check PayHere and BitcoinDeepa before POST /transaction/reset-retry-count/<id>)`,
+      heading: `Paid but not settled after ${MAX_SETTLEMENT_ATTEMPTS} attempts`,
+      hint: 'check PayHere and BitcoinDeepa before POST /transaction/reset-retry-count/<id>',
       total: await this.count(query()),
       lines: rows.map(
         (row) =>
@@ -187,6 +241,13 @@ export class ReviewReminderService {
             ? ` - ${describeFailure(row.settlement_failure)}`
             : ''),
       ),
+      columns: ['Payment', 'Sats', 'User', 'Reason'],
+      rows: rows.map((row) => [
+        row.payhere_pay_id,
+        num(row.satoshis_purchased),
+        `#UID${row.user_id ?? '?'}`,
+        row.settlement_failure ? describeFailure(row.settlement_failure) : '',
+      ]),
     };
   }
 

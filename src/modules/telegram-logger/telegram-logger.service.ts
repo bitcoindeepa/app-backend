@@ -23,9 +23,28 @@ const MAX_QUEUED_ALERTS = 20;
 /** A log-group call: its result, or whether it failed only because of rate limits */
 type CallResult =
   | { ok: true; result: { message_id?: number } | true }
-  | { ok: false; limited: boolean };
+  | { ok: false; limited: boolean; status?: number };
 
-type LogGroupMethod = 'sendMessage' | 'editMessageText' | 'setMessageReaction';
+type LogGroupMethod =
+  | 'sendMessage'
+  | 'sendRichMessage'
+  | 'editMessageText'
+  | 'setMessageReaction';
+
+/** An alert in both forms: rich (sendRichMessage) and the plain HTML fallback */
+interface Alert {
+  rich: string;
+  plain: string;
+}
+
+/** Plain text as rich paragraphs, one per non-empty line (escaped) */
+export function richParagraphs(text: string): string {
+  return text
+    .split('\n')
+    .filter((line) => line.trim() !== '')
+    .map((line) => `<p>${escapeHtml(line)}</p>`)
+    .join('');
+}
 
 @Injectable()
 export class TelegramLoggerService {
@@ -40,7 +59,9 @@ export class TelegramLoggerService {
   private droppedWhileLimited = 0;
   private recentSends: number[] = [];
   private warnedNotConfigured = false;
-  private queuedAlerts: string[] = [];
+  private queuedAlerts: Alert[] = [];
+  /** Set when the Bot API doesn't know sendRichMessage (404): plain alerts only */
+  private richUnsupported = false;
   private flushTimer: NodeJS.Timeout | null = null;
   /** A drain is sending the queue: no second one may start */
   private draining = false;
@@ -104,10 +125,20 @@ export class TelegramLoggerService {
   /**
    * Something that needs a human to look at it (fraud signal, manual fix).
    * `text` is plain text: it is escaped, since an error message containing
-   * `<` or `&` would make Telegram reject the whole (HTML) alert.
+   * `<` or `&` would make Telegram reject the whole (HTML) alert. It goes out
+   * as a rich message (heading + `richHtml`, or `text` as paragraphs); if
+   * Telegram refuses that, as the plain HTML message it always was.
+   * `richHtml` is rich-message HTML whose dynamic parts the caller escaped.
    */
-  async logAlert(source: string, text: string): Promise<void> {
-    const message = `⚠️ <b>ALERT (${escapeHtml(source)})</b>\n${escapeHtml(text)}`;
+  async logAlert(
+    source: string,
+    text: string,
+    richHtml?: string,
+  ): Promise<void> {
+    const message: Alert = {
+      rich: `<h3>⚠️ ${escapeHtml(source)}</h3>${richHtml ?? richParagraphs(text)}`,
+      plain: `⚠️ <b>ALERT (${escapeHtml(source)})</b>\n${escapeHtml(text)}`,
+    };
     if (!this.isConfigured()) {
       this.logger.error(`ALERT (${source}): ${text}`);
       return;
@@ -117,11 +148,7 @@ export class TelegramLoggerService {
     const outcome =
       this.queuedAlerts.length > 0
         ? { ok: false, limited: true }
-        : await this.callLogGroup(
-            'sendMessage',
-            this.alertPayload(message),
-            true,
-          );
+        : await this.sendAlert(message);
     if (outcome.ok) return;
     // Never lose an alert silently: it's always in the app log, and when only
     // rate limits stopped it, it's sent once the pause ends
@@ -134,17 +161,42 @@ export class TelegramLoggerService {
     }
   }
 
-  /** An alert goes to ALERT_TOPIC_ID (LOG_TOPIC_ID when unset). */
-  private alertPayload(message: string): Record<string, unknown> {
-    return {
-      text: message,
-      parse_mode: 'HTML',
-      message_thread_id: this.alertTopicId,
-    };
+  /**
+   * Send one alert to ALERT_TOPIC_ID (LOG_TOPIC_ID when unset): rich first,
+   * the plain HTML message when Telegram refuses the rich one for any reason
+   * but a rate limit (that is retried as is, from the queue).
+   */
+  private async sendAlert(alert: Alert): Promise<CallResult> {
+    if (!this.richUnsupported) {
+      const rich = await this.callLogGroup(
+        'sendRichMessage',
+        {
+          rich_message: { html: alert.rich },
+          message_thread_id: this.alertTopicId,
+        },
+        true,
+      );
+      if (rich.ok || rich.limited) return rich;
+      if (rich.status === 404) {
+        this.richUnsupported = true;
+        this.logger.warn(
+          'Telegram has no sendRichMessage here: sending plain alerts from now on',
+        );
+      }
+    }
+    return this.callLogGroup(
+      'sendMessage',
+      {
+        text: alert.plain,
+        parse_mode: 'HTML',
+        message_thread_id: this.alertTopicId,
+      },
+      true,
+    );
   }
 
   /** Hold an alert until the rate limit pause ends. False when the queue is full. */
-  private queueAlert(message: string): boolean {
+  private queueAlert(message: Alert): boolean {
     if (this.queuedAlerts.length >= MAX_QUEUED_ALERTS) return false;
     this.queuedAlerts.push(message);
     this.scheduleAlertFlush();
@@ -172,11 +224,7 @@ export class TelegramLoggerService {
     this.draining = true;
     try {
       while (this.queuedAlerts.length > 0) {
-        const outcome = await this.callLogGroup(
-          'sendMessage',
-          this.alertPayload(this.queuedAlerts[0]),
-          true,
-        );
+        const outcome = await this.sendAlert(this.queuedAlerts[0]);
         // Limited: the head stays queued and is retried by the next drain
         if (!outcome.ok && outcome.limited) break;
         // Sent, or failed for another reason (already in the app log): next
@@ -297,11 +345,13 @@ export class TelegramLoggerService {
     const now = Date.now();
     this.recentSends = this.recentSends.filter((t) => now - t < 60_000);
     const cap =
-      priority && method === 'sendMessage'
+      priority && (method === 'sendMessage' || method === 'sendRichMessage')
         ? ALL_MESSAGES_PER_MINUTE
         : ROUTINE_MESSAGES_PER_MINUTE;
     if (now < this.blockedUntil || this.recentSends.length >= cap) {
-      if (method === 'sendMessage') this.droppedWhileLimited++;
+      if (method === 'sendMessage' || method === 'sendRichMessage') {
+        this.droppedWhileLimited++;
+      }
       return false;
     }
     if (this.droppedWhileLimited > 0) {
@@ -360,7 +410,7 @@ export class TelegramLoggerService {
       this.logger.error(
         `Telegram ${method} failed (HTTP ${response.status}): ${data.description ?? 'no description'}`,
       );
-      return { ok: false, limited: false };
+      return { ok: false, limited: false, status: response.status };
     } catch (error) {
       this.logger.error(
         `Telegram ${method} failed: ${error instanceof Error ? error.message : String(error)}`,

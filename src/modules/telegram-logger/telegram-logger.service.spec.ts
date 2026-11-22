@@ -14,18 +14,69 @@ describe('TelegramLoggerService.logAlert', () => {
     global.fetch = fetchMock as unknown as typeof fetch;
   });
 
-  it('escapes the text so Telegram accepts the HTML message', async () => {
+  const call = (i: number) => {
+    const [url, init] = fetchMock.mock.calls[i] as [string, { body: string }];
+    return {
+      method: url.split('/').pop(),
+      body: JSON.parse(init.body) as {
+        text?: string;
+        parse_mode?: string;
+        rich_message?: { html: string };
+      },
+    };
+  };
+  const refused = (status: number) =>
+    Promise.resolve({
+      ok: false,
+      status,
+      json: () => Promise.resolve({ ok: false, description: 'Bad Request' }),
+    });
+
+  it('sends a rich message: escaped heading, the text as paragraphs', async () => {
+    await new TelegramLoggerService().logAlert(
+      'PayHere <api>',
+      'Error: <html>Bad Gateway</html> & retry\n\nsecond line',
+    );
+    expect(call(0).method).toBe('sendRichMessage');
+    expect(call(0).body.rich_message?.html).toBe(
+      '<h3>⚠️ PayHere &lt;api&gt;</h3><p>Error: &lt;html&gt;Bad Gateway&lt;/html&gt; &amp; retry</p><p>second line</p>',
+    );
+  });
+
+  it('uses the caller rich HTML when given', async () => {
+    await new TelegramLoggerService().logAlert(
+      'Waiting for review',
+      'plain',
+      '<table><tr><td>x</td></tr></table>',
+    );
+    expect(call(0).body.rich_message?.html).toBe(
+      '<h3>⚠️ Waiting for review</h3><table><tr><td>x</td></tr></table>',
+    );
+  });
+
+  it('falls back to the escaped plain HTML message when the rich one is refused', async () => {
+    fetchMock.mockImplementationOnce(() => refused(400));
     await new TelegramLoggerService().logAlert(
       'PayHere <api>',
       'Error: <html>Bad Gateway</html> & retry',
     );
-    const body = JSON.parse(
-      (fetchMock.mock.calls[0] as [string, { body: string }])[1].body,
-    ) as { text: string; parse_mode: string };
-    expect(body.parse_mode).toBe('HTML');
-    expect(body.text).toBe(
+    expect(call(1).method).toBe('sendMessage');
+    expect(call(1).body.parse_mode).toBe('HTML');
+    expect(call(1).body.text).toBe(
       '⚠️ <b>ALERT (PayHere &lt;api&gt;)</b>\nError: &lt;html&gt;Bad Gateway&lt;/html&gt; &amp; retry',
     );
+  });
+
+  it('stops trying rich messages once the Bot API says it has no such method', async () => {
+    const service = new TelegramLoggerService();
+    fetchMock.mockImplementationOnce(() => refused(404));
+    await service.logAlert('S', 'one');
+    await service.logAlert('S', 'two');
+    expect([0, 1, 2].map((i) => call(i).method)).toEqual([
+      'sendRichMessage',
+      'sendMessage',
+      'sendMessage',
+    ]);
   });
 
   describe('topic', () => {
@@ -145,21 +196,23 @@ describe('TelegramLoggerService log group limits', () => {
 
     await jest.advanceTimersByTimeAsync(11_000);
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    const body = JSON.parse(
+    expect(
       (fetchMock.mock.calls[1] as [string, { body: string }])[1].body,
-    ) as { text: string };
-    expect(body.text).toContain('payout stuck');
+    ).toContain('payout stuck');
   });
 
   it("logs an alert Telegram refused for another reason (it's not retried)", async () => {
     const service = new TelegramLoggerService();
-    fetchMock.mockImplementationOnce(() =>
+    const badRequest = () =>
       Promise.resolve({
         ok: false,
         status: 400,
         json: () => Promise.resolve({ ok: false, description: 'Bad Request' }),
-      }),
-    );
+      });
+    // the rich message, then the plain fallback
+    fetchMock
+      .mockImplementationOnce(badRequest)
+      .mockImplementationOnce(badRequest);
     await service.logAlert('Settlement', 'payout stuck');
     expect(error).toHaveBeenCalledWith(
       'ALERT (Settlement) not sent to Telegram: payout stuck',
@@ -213,14 +266,9 @@ describe('TelegramLoggerService log group limits', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
 
     await jest.advanceTimersByTimeAsync(1_000);
-    const texts = fetchMock.mock.calls.slice(1).map(
-      (c) =>
-        (
-          JSON.parse((c as [string, { body: string }])[1].body) as {
-            text: string;
-          }
-        ).text,
-    );
+    const texts = fetchMock.mock.calls
+      .slice(1)
+      .map((c) => (c as [string, { body: string }])[1].body);
     expect(texts).toHaveLength(2);
     expect(texts[0]).toContain('first');
     expect(texts[1]).toContain('second');
