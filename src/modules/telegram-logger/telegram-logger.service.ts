@@ -35,6 +35,12 @@ type LogGroupMethod =
 interface Alert {
   rich: string;
   plain: string;
+  /**
+   * Telegram refused the rich form: later attempts (from the queue) send
+   * the plain one only, so a refused rich send can't keep using the slot the
+   * plain one needs
+   */
+  richRefused?: boolean;
 }
 
 /** Plain text as rich paragraphs, one per non-empty line (escaped) */
@@ -167,7 +173,7 @@ export class TelegramLoggerService {
    * but a rate limit (that is retried as is, from the queue).
    */
   private async sendAlert(alert: Alert): Promise<CallResult> {
-    if (!this.richUnsupported) {
+    if (!this.richUnsupported && !alert.richRefused) {
       const rich = await this.callLogGroup(
         'sendRichMessage',
         {
@@ -177,6 +183,7 @@ export class TelegramLoggerService {
         true,
       );
       if (rich.ok || rich.limited) return rich;
+      alert.richRefused = true;
       if (rich.status === 404) {
         this.richUnsupported = true;
         this.logger.warn(

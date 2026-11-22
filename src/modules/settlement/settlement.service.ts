@@ -417,14 +417,9 @@ export class SettlementService {
       const failure = result.failure ?? 'REJECTED';
 
       if (NEEDS_HUMAN_FAILURES.includes(failure)) {
-        // Retrying can't help (over the bot's limit, unknown wallet): use up
-        // the attempts so it waits for a human, and say so now, not after
-        // five identical refusals. Guarded on our own attempt.
-        await this.knexService
-          .knex('transaction')
-          .update({ retry_count: MAX_SETTLEMENT_ATTEMPTS })
-          .where('payhere_pay_id', payhere_pay_id)
-          .where('retry_count', currentRetryCount);
+        // recordFailure used up the attempts (retrying can't help: over the
+        // bot's limit, unknown wallet), so say so now, not after five
+        // identical refusals
         const alert = `Settlement of ${payhere_pay_id} (${satoshis_purchased} sats to user ${telegram_id}) stopped: ${describeFailure(failure)}. The bot said: ${result.message}. Retrying won't help - fix it, then POST /transaction/reset-retry-count/${payhere_pay_id}.`;
         this.logger.error(alert);
         await this.telegramLogger.logAlert('Settlement', alert);
@@ -497,9 +492,17 @@ export class SettlementService {
     attempt: number,
     result: FundTransferResponse,
   ): Promise<void> {
+    const failure = result.failure ?? 'REJECTED';
     await this.knexService
       .knex('transaction')
-      .update({ settlement_failure: result.failure ?? 'REJECTED' })
+      .update({
+        settlement_failure: failure,
+        // A refusal retrying can't fix uses up the attempts in the same
+        // write, so no partial failure can leave it to be retried
+        ...(NEEDS_HUMAN_FAILURES.includes(failure)
+          ? { retry_count: MAX_SETTLEMENT_ATTEMPTS }
+          : {}),
+      })
       .where('payhere_pay_id', payhere_pay_id)
       .where('retry_count', attempt);
   }

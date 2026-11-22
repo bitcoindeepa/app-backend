@@ -219,6 +219,28 @@ describe('TelegramLoggerService log group limits', () => {
     );
   });
 
+  it('a queued alert whose rich form was refused is retried as plain text only', async () => {
+    jest.useFakeTimers({ now: 1_000_000 });
+    const service = new TelegramLoggerService();
+    fetchMock
+      .mockImplementationOnce(() =>
+        Promise.resolve({
+          ok: false,
+          status: 400,
+          json: () => Promise.resolve({ ok: false, description: 'Bad HTML' }),
+        }),
+      ) // the rich form is refused
+      .mockImplementationOnce(() => tooMany(10)); // the plain fallback is limited
+    await service.logAlert('Settlement', 'payout stuck');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    await jest.advanceTimersByTimeAsync(11_000);
+    const methods = fetchMock.mock.calls.map(([url]) =>
+      String(url).split('/').pop(),
+    );
+    expect(methods).toEqual(['sendRichMessage', 'sendMessage', 'sendMessage']);
+  });
+
   it('a 429 on a reaction delays a later alert instead of losing it', async () => {
     jest.useFakeTimers({ now: 1_000_000 });
     const service = new TelegramLoggerService();
