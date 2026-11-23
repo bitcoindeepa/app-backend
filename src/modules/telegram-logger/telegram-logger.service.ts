@@ -46,6 +46,43 @@ interface Alert {
   richRefused?: boolean;
 }
 
+/**
+ * How urgent an alert is, shown as its icon: urgent = money at risk, stopped
+ * = a human must fix something, config = every payout is affected, waiting =
+ * waiting on someone (no fault), reminder = a repeat of open items.
+ */
+export type AlertLevel =
+  | 'urgent'
+  | 'stopped'
+  | 'config'
+  | 'waiting'
+  | 'warning'
+  | 'reminder';
+
+const ALERT_ICONS: Record<AlertLevel, string> = {
+  urgent: '🚨',
+  stopped: '🛑',
+  config: '🔑',
+  waiting: '⏳',
+  warning: '⚠️',
+  reminder: '🔔',
+};
+
+/** One "Label  value" row under an alert; `code` shows the value as code (ids) */
+export type AlertField = [label: string, value: string, style?: 'code'];
+
+export interface AlertDetails {
+  /** After the source in the heading: "Settlement: waiting for approval" */
+  title?: string;
+  level?: AlertLevel;
+  fields?: AlertField[];
+  /** Rich-message HTML in place of `text` (dynamic parts escaped by the caller) */
+  richHtml?: string;
+}
+
+const fieldValue = ([, value, style]: AlertField) =>
+  style === 'code' ? `<code>${escapeHtml(value)}</code>` : escapeHtml(value);
+
 /** Plain text as rich paragraphs, one per non-empty line (escaped) */
 export function richParagraphs(text: string): string {
   return text
@@ -141,18 +178,36 @@ export class TelegramLoggerService {
    * Something that needs a human to look at it (fraud signal, manual fix).
    * `text` is plain text: it is escaped, since an error message containing
    * `<` or `&` would make Telegram reject the whole (HTML) alert. It goes out
-   * as a rich message (heading + `richHtml`, or `text` as paragraphs); if
-   * Telegram refuses that, as the plain HTML message it always was.
-   * `richHtml` is rich-message HTML whose dynamic parts the caller escaped.
+   * as a rich message: "<icon> <source>: <title>" heading, `richHtml` or
+   * `text` as paragraphs, then `fields` as a compact table. If Telegram
+   * refuses that, as a plain HTML message with the same content as lines.
+   * Keep `text` to a sentence or two: the fields carry the ids and amounts.
    */
   async logAlert(
     source: string,
     text: string,
-    richHtml?: string,
+    details: AlertDetails = {},
   ): Promise<void> {
+    const icon = ALERT_ICONS[details.level ?? 'warning'];
+    const heading = escapeHtml(
+      details.title ? `${source}: ${details.title}` : source,
+    );
+    const fields = details.fields ?? [];
+    const table = fields.length
+      ? `<table compact>${fields
+          .map(
+            (f) =>
+              `<tr><td><b>${escapeHtml(f[0])}</b></td><td>${fieldValue(f)}</td></tr>`,
+          )
+          .join('')}</table>`
+      : '';
     const message: Alert = {
-      rich: `<h3>⚠️ ${escapeHtml(source)}</h3>${richHtml ?? richParagraphs(text)}`,
-      plain: `⚠️ <b>ALERT (${escapeHtml(source)})</b>\n${escapeHtml(text)}`,
+      rich: `<h3>${icon} ${heading}</h3>${details.richHtml ?? richParagraphs(text)}${table}`,
+      plain: [
+        `${icon} <b>${heading}</b>`,
+        escapeHtml(text),
+        ...fields.map((f) => `${escapeHtml(f[0])}: ${fieldValue(f)}`),
+      ].join('\n'),
     };
     if (!this.isConfigured()) {
       this.logger.error(`ALERT (${source}): ${text}`);

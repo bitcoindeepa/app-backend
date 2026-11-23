@@ -116,11 +116,10 @@ export class ReviewReminderService {
           ].join('\n');
         }),
       ].join('\n');
-      await this.telegramLogger.logAlert(
-        'Waiting for review',
-        text,
-        richReminder(total, groups),
-      );
+      await this.telegramLogger.logAlert('Waiting for review', text, {
+        level: 'reminder',
+        richHtml: richReminder(total, groups),
+      });
     } catch (error) {
       this.logger.error(`Review reminder failed: ${errorMessage(error)}`);
     }

@@ -44,13 +44,36 @@ describe('TelegramLoggerService.logAlert', () => {
   });
 
   it('uses the caller rich HTML when given', async () => {
-    await new TelegramLoggerService().logAlert(
-      'Waiting for review',
-      'plain',
-      '<table><tr><td>x</td></tr></table>',
-    );
+    await new TelegramLoggerService().logAlert('Waiting for review', 'plain', {
+      richHtml: '<table><tr><td>x</td></tr></table>',
+    });
     expect(call(0).body.rich_message?.html).toBe(
       '<h3>⚠️ Waiting for review</h3><table><tr><td>x</td></tr></table>',
+    );
+  });
+
+  it('shows the level icon and title in the heading, and the fields as a table (rich) or lines (plain)', async () => {
+    fetchMock.mockImplementationOnce(() => refused(400));
+    await new TelegramLoggerService().logAlert(
+      'Settlement',
+      'Approve it in the bot chat.',
+      {
+        level: 'waiting',
+        title: 'waiting for approval',
+        fields: [
+          ['Payment', 'P<1>', 'code'],
+          ['User', '#UID42'],
+        ],
+      },
+    );
+    expect(call(0).body.rich_message?.html).toBe(
+      '<h3>⏳ Settlement: waiting for approval</h3><p>Approve it in the bot chat.</p>' +
+        '<table compact><tr><td><b>Payment</b></td><td><code>P&lt;1&gt;</code></td></tr>' +
+        '<tr><td><b>User</b></td><td>#UID42</td></tr></table>',
+    );
+    expect(call(1).body.text).toBe(
+      '⏳ <b>Settlement: waiting for approval</b>\nApprove it in the bot chat.\n' +
+        'Payment: <code>P&lt;1&gt;</code>\nUser: #UID42',
     );
   });
 
@@ -63,7 +86,7 @@ describe('TelegramLoggerService.logAlert', () => {
     expect(call(1).method).toBe('sendMessage');
     expect(call(1).body.parse_mode).toBe('HTML');
     expect(call(1).body.text).toBe(
-      '⚠️ <b>ALERT (PayHere &lt;api&gt;)</b>\nError: &lt;html&gt;Bad Gateway&lt;/html&gt; &amp; retry',
+      '⚠️ <b>PayHere &lt;api&gt;</b>\nError: &lt;html&gt;Bad Gateway&lt;/html&gt; &amp; retry',
     );
   });
 
