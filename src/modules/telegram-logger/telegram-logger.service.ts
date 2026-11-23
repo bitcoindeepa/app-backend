@@ -17,6 +17,10 @@ const ROUTINE_MESSAGES_PER_MINUTE = 15;
 const ALL_MESSAGES_PER_MINUTE = 19;
 /** A 429 without retry_after (body or header): pause this long */
 const DEFAULT_RETRY_AFTER_SECONDS = 30;
+/** "Rs. 25,000" (cents only when there are any) */
+export const lkr = (amount: string | number): string =>
+  `Rs. ${Number(amount).toLocaleString('en-US', { maximumFractionDigits: 2 })}`;
+
 /** Routine logs link profiles (t.me): no preview cards in the group */
 const NO_LINK_PREVIEW = { is_disabled: true };
 /** Alerts held while rate limited, sent when the pause ends */
@@ -80,11 +84,10 @@ export class TelegramLoggerService {
     oneTime = false,
   ): Promise<TgMessage | null> {
     const message =
-      `Action: <b>${oneTime ? 'New One-time Buy #BUY' : 'New Transaction'}</b>\n` +
-      `User ID: <b>#UID${telegramId}</b>\n` +
-      `Transaction ID: <b>#TRX${payhereId}</b>\n` +
-      `Amount: <b>${amount} LKR</b>\n` +
-      `Status: <b>${status}</b>`;
+      `💳 <b>${oneTime ? 'New one-time buy' : 'New DCA payment'}</b>${oneTime ? ' #BUY' : ''}\n` +
+      `Payment: #TRX${escapeHtml(payhereId)}\n` +
+      `Amount: ${lkr(amount)} · ${escapeHtml(status)}\n` +
+      `User ID: <b>#UID${telegramId}</b>`;
     return await this.sendMessage(message);
   }
 
@@ -95,11 +98,10 @@ export class TelegramLoggerService {
     attemptNumber: number,
   ): Promise<TgMessage | null> {
     const message =
-      `Action: <b>Settlement Attempt</b>\n` +
-      `User ID: <b>#UID${telegramId}</b>\n` +
-      `Transaction ID: <b>#TRX${payhereId}</b>\n` +
-      `Satoshis: <b>${satoshis.toLocaleString()}</b>\n` +
-      `Attempt: <b>#${attemptNumber}</b>`;
+      `⚡ <b>Settlement attempt ${attemptNumber}</b>\n` +
+      `Payment: #TRX${escapeHtml(payhereId)}\n` +
+      `Sats: ${Number(satoshis).toLocaleString('en-US')}\n` +
+      `User ID: <b>#UID${telegramId}</b>`;
     return await this.sendMessage(message);
   }
 
@@ -109,11 +111,10 @@ export class TelegramLoggerService {
     _package: Package,
   ): Promise<void> {
     const message =
-      `Action: <b>New Subscription</b>\n` +
-      `User ID: <b>#UID${userId}</b>\n` +
-      `Subscription ID: <b>#SUB${subscriptionId}</b>\n` +
-      `Package: <b>${_package.name}</b>\n` +
-      `Amount: <b>${_package.amount} LKR</b>`;
+      `📅 <b>New subscription</b>\n` +
+      `Plan: ${escapeHtml(_package.name)} · ${lkr(_package.amount)}\n` +
+      `Subscription: #SUB${escapeHtml(subscriptionId)}\n` +
+      `User ID: <b>#UID${userId}</b>`;
     await this.sendMessage(message, true);
   }
 
@@ -241,7 +242,7 @@ export class TelegramLoggerService {
     action: string,
     user: JwtPayload,
   ): Promise<TgMessage | null> {
-    const message = `Action: <b>${action}</b>\n` + this.formatUser(user);
+    const message = `<b>${escapeHtml(action)}</b>\n` + this.formatUser(user);
     return await this.sendMessage(message);
   }
 

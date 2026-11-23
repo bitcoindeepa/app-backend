@@ -84,13 +84,30 @@ describe('TelegramLoggerService routine logs', () => {
       tgUsername: 'dinesh2k21',
     });
     expect(sent().text).toBe(
-      'Action: <b>Buy</b>\n' +
+      '<b>Buy</b>\n' +
         'Telegram: <a href="https://t.me/dinesh2k21">dinesh2k21</a>\n' +
         'App user: <code>asa332</code>\n' +
         'User ID: <b>#UID42</b>',
     );
     expect(sent().text).not.toContain('@');
     expect(sent().link_preview_options).toEqual({ is_disabled: true });
+  });
+
+  it('keeps payment logs to an icon line, the details and the user last', async () => {
+    const service = new TelegramLoggerService();
+    await service.logNewTransaction(
+      '320049',
+      '25000.00',
+      '42',
+      'SUCCESS',
+      true,
+    );
+    expect(sent().text).toBe(
+      '💳 <b>New one-time buy</b> #BUY\n' +
+        'Payment: #TRX320049\n' +
+        'Amount: Rs. 25,000 · SUCCESS\n' +
+        'User ID: <b>#UID42</b>',
+    );
   });
 
   it('says so when either name is missing', async () => {
