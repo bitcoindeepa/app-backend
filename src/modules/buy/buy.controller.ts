@@ -12,7 +12,10 @@ import { KycVerifiedGuard } from '../auth/kyc-verified.guard';
 import { RequireKyc } from '../auth/require-kyc.decorator';
 import { CurrentUser } from '../auth/user.decorator';
 import type { JwtPayload } from '../auth/auth.service';
-import { TelegramLoggerService } from '../telegram-logger/telegram-logger.service';
+import {
+  TelegramLoggerService,
+  lkr,
+} from '../telegram-logger/telegram-logger.service';
 import { BuyService } from './buy.service';
 import { BuyLinkDto } from './dto/buy.dto';
 
@@ -35,7 +38,7 @@ export class BuyController {
   @RequireKyc()
   createPayHereLink(@CurrentUser() user: JwtPayload, @Body() body: BuyLinkDto) {
     return this.telegramLoggerService.trackAction(
-      `Generate one-time buy link (/buy/payhere-link) ${body.amount_lkr} LKR`,
+      `🛒 One-time buy link: ${lkr(body.amount_lkr)}`,
       user,
       () => this.buyService.createPayHereLink(user.id, body.amount_lkr),
     );

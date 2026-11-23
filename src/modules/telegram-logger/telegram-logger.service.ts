@@ -20,6 +20,14 @@ const DEFAULT_RETRY_AFTER_SECONDS = 30;
 /** Rich alerts refused in a row before alerts go plain for RICH_PAUSE_MS */
 const RICH_REFUSALS_BEFORE_PAUSE = 3;
 const RICH_PAUSE_MS = 60 * 60_000;
+
+/** "Rs. 25,000" (cents only when there are any) */
+export const lkr = (amount: string | number): string =>
+  `Rs. ${Number(amount).toLocaleString('en-US', { maximumFractionDigits: 2 })}`;
+
+/** Routine logs link profiles (t.me): no preview cards in the group */
+const NO_LINK_PREVIEW = { is_disabled: true };
+
 /** Alerts held while rate limited, sent when the pause ends */
 const MAX_QUEUED_ALERTS = 20;
 
@@ -125,8 +133,22 @@ export class TelegramLoggerService {
     this.alertTopicId = process.env.ALERT_TOPIC_ID || this.logTopicId;
   }
 
-  private formatUsername(user: JwtPayload): string {
-    return user.username ? `@${user.username}` : 'Unknown';
+  /**
+   * Who did it, without ever mentioning anyone: no "@", so Telegram makes no
+   * mention and notifies nobody (an app username can even be someone else's
+   * Telegram name). The Telegram username links to their profile (t.me is a
+   * plain link, not a mention); the app username is code text.
+   */
+  private formatUser(user: JwtPayload): string {
+    const tg = user.tgUsername
+      ? `<a href="https://t.me/${encodeURIComponent(user.tgUsername)}">${escapeHtml(user.tgUsername)}</a>`
+      : // Null when they have no Telegram username, or haven't logged in
+        // since tg_username was added: "unknown" is true in both cases
+        'unknown';
+    const app = user.username
+      ? `<code>${escapeHtml(user.username)}</code>`
+      : 'not set';
+    return `Telegram: ${tg}\nApp user: ${app}\nUser ID: <b>#UID${user.id}</b>`;
   }
 
   async logNewTransaction(
@@ -137,11 +159,10 @@ export class TelegramLoggerService {
     oneTime = false,
   ): Promise<TgMessage | null> {
     const message =
-      `Action: <b>${oneTime ? 'New One-time Buy #BUY' : 'New Transaction'}</b>\n` +
-      `User ID: <b>#UID${telegramId}</b>\n` +
-      `Transaction ID: <b>#TRX${payhereId}</b>\n` +
-      `Amount: <b>${amount} LKR</b>\n` +
-      `Status: <b>${status}</b>`;
+      `💳 <b>${oneTime ? 'New one-time buy' : 'New DCA payment'}</b>${oneTime ? ' #BUY' : ''}\n` +
+      `Payment: #TRX${escapeHtml(payhereId)}\n` +
+      `Amount: ${lkr(amount)} · ${escapeHtml(status)}\n` +
+      `User ID: <b>#UID${telegramId}</b>`;
     return await this.sendMessage(message);
   }
 
@@ -152,11 +173,10 @@ export class TelegramLoggerService {
     attemptNumber: number,
   ): Promise<TgMessage | null> {
     const message =
-      `Action: <b>Settlement Attempt</b>\n` +
-      `User ID: <b>#UID${telegramId}</b>\n` +
-      `Transaction ID: <b>#TRX${payhereId}</b>\n` +
-      `Satoshis: <b>${satoshis.toLocaleString()}</b>\n` +
-      `Attempt: <b>#${attemptNumber}</b>`;
+      `⚡ <b>Settlement attempt ${attemptNumber}</b>\n` +
+      `Payment: #TRX${escapeHtml(payhereId)}\n` +
+      `Sats: ${Number(satoshis).toLocaleString('en-US')}\n` +
+      `User ID: <b>#UID${telegramId}</b>`;
     return await this.sendMessage(message);
   }
 
@@ -166,11 +186,10 @@ export class TelegramLoggerService {
     _package: Package,
   ): Promise<void> {
     const message =
-      `Action: <b>New Subscription</b>\n` +
-      `User ID: <b>#UID${userId}</b>\n` +
-      `Subscription ID: <b>#SUB${subscriptionId}</b>\n` +
-      `Package: <b>${_package.name}</b>\n` +
-      `Amount: <b>${_package.amount} LKR</b>`;
+      `📅 <b>New subscription</b>\n` +
+      `Plan: ${escapeHtml(_package.name)} · ${lkr(_package.amount)}\n` +
+      `Subscription: #SUB${escapeHtml(subscriptionId)}\n` +
+      `User ID: <b>#UID${userId}</b>`;
     await this.sendMessage(message, true);
   }
 
@@ -351,10 +370,7 @@ export class TelegramLoggerService {
     action: string,
     user: JwtPayload,
   ): Promise<TgMessage | null> {
-    const message =
-      `Action: <b>${action}</b>\n` +
-      `Username: <b>${this.formatUsername(user)}</b>\n` +
-      `User ID: <b>#UID${user.id}</b>`;
+    const message = `<b>${escapeHtml(action)}</b>\n` + this.formatUser(user);
     return await this.sendMessage(message);
   }
 
@@ -384,6 +400,7 @@ export class TelegramLoggerService {
       message_id: message.id.toString(),
       text,
       parse_mode: 'HTML',
+      link_preview_options: NO_LINK_PREVIEW,
     });
     if (outcome.ok) message.text = text;
   }
@@ -519,7 +536,7 @@ export class TelegramLoggerService {
     if (!this.isConfigured()) return null;
     const outcome = await this.callLogGroup(
       'sendMessage',
-      { text, parse_mode: 'HTML' },
+      { text, parse_mode: 'HTML', link_preview_options: NO_LINK_PREVIEW },
       priority,
     );
     if (!outcome.ok) return null;

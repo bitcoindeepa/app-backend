@@ -40,20 +40,15 @@ export class SubscriptionController {
   async getCurrentSubscription(
     @CurrentUser() user: JwtPayload,
   ): Promise<SubscriptionDetails> {
-    return this.telegramLoggerService.trackAction(
-      'Current Subscription (/subscription/current)',
-      user,
-      async () => {
-        const subscription =
-          await this.subscriptionService.getCurrentSubscriptionDetailsForUser(
-            user.id,
-          );
-        if (!subscription) {
-          throw new NotFoundException('Subscription not found');
-        }
-        return subscription;
-      },
-    );
+    // Read-only: not logged to the ops group (page loads drown real actions)
+    const subscription =
+      await this.subscriptionService.getCurrentSubscriptionDetailsForUser(
+        user.id,
+      );
+    if (!subscription) {
+      throw new NotFoundException('Subscription not found');
+    }
+    return subscription;
   }
 
   @Post('payhere-link')
@@ -64,7 +59,7 @@ export class SubscriptionController {
     @Body() body: PayHereLinkDto,
   ): Promise<{ link: string }> {
     return this.telegramLoggerService.trackAction(
-      'Generate PayHere Link (/subscription/payhere-link)',
+      '🛒 Plan checkout link',
       user,
       async () => {
         const existingSubscription =
@@ -126,7 +121,7 @@ export class SubscriptionController {
   @UseGuards(ConditionalAuthGuard)
   async cancelCurrentSubscription(@CurrentUser() user: JwtPayload) {
     return this.telegramLoggerService.trackAction(
-      'Cancel Subscription (/subscription/cancel)',
+      '📅 Subscription cancelled',
       user,
       async (logMessage) => {
         const subscription =
@@ -137,7 +132,7 @@ export class SubscriptionController {
 
         await this.telegramLoggerService.appendToMessage(
           logMessage,
-          `Subscription ID: <b>#SUB${subscription.payhere_sub_id}</b>`,
+          `Subscription: #SUB${subscription.payhere_sub_id}`,
         );
         await this.subscriptionService.cancelPayHereSubscription(
           subscription.payhere_sub_id,

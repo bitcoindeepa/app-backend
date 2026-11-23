@@ -50,13 +50,25 @@ export interface User {
   avatar_seed?: string | null;
   /** The member's Bitcoin Deepa @username (not Telegram's); claimed once, permanent */
   username?: string | null;
+  /** Their Telegram username as of their last login (logs only; not unique) */
+  tg_username?: string | null;
 }
 
 export interface TelegramProfile {
   id: string;
   first_name: string;
   last_name?: string;
+  /** Their Telegram username from this login (none = they have none) */
+  tg_username?: string | null;
 }
+
+/** Telegram usernames: 4-32 of letters, digits and _ (anything else isn't stored) */
+const TG_USERNAME_PATTERN = /^[A-Za-z0-9_]{4,32}$/;
+
+export const cleanTgUsername = (value?: string | null): string | null => {
+  const name = value?.trim().replace(/^@/, '');
+  return name && TG_USERNAME_PATTERN.test(name) ? name : null;
+};
 
 export interface ProfileDetails {
   first_name: string;
@@ -91,12 +103,14 @@ export class UserService {
   constructor(private readonly knexService: KnexService) {}
 
   async upsertTelegramUser(profile: TelegramProfile): Promise<void> {
+    const tgUsername = cleanTgUsername(profile.tg_username);
     await this.knexService
       .knex('user')
       .insert({
         id: profile.id,
         first_name: profile.first_name,
         last_name: profile.last_name ?? null,
+        tg_username: tgUsername,
       })
       .onConflict('id')
       .merge({
@@ -106,6 +120,16 @@ export class UserService {
       // Once the user completes their profile (legal name used for PayHere
       // billing), stop overwriting it with their Telegram display name.
       .whereNull('user.email');
+    // The Telegram username follows Telegram on every login, profile or not
+    // (a rename, or removing it, clears the old one). A separate statement on
+    // purpose: the insert above covers new users, but its merge() stops at
+    // the whereNull('user.email') guard, so for members with a completed
+    // profile only this one updates it. Don't fold it into the merge.
+    await this.knexService
+      .knex('user')
+      .where('id', profile.id)
+      .whereRaw('tg_username IS DISTINCT FROM ?', [tgUsername])
+      .update({ tg_username: tgUsername });
   }
 
   /**

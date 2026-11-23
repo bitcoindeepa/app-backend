@@ -174,15 +174,11 @@ export class TransactionController {
     const pageNum = parseIntParam(page, 1, 1, 10_000);
     const limitNum = parseIntParam(limit, 10, 1, 100);
 
-    return this.telegramLoggerService.trackAction(
-      'Transaction List (/transaction/list)',
-      user,
-      () =>
-        this.transactionService.getTransactionsByUserIdPaginated(
-          user.id,
-          pageNum,
-          limitNum,
-        ),
+    // Read-only: not logged to the ops group (page loads drown real actions)
+    return this.transactionService.getTransactionsByUserIdPaginated(
+      user.id,
+      pageNum,
+      limitNum,
     );
   }
 
@@ -233,10 +229,6 @@ export class TransactionController {
   @Get('dca-summary')
   @UseGuards(ConditionalAuthGuard)
   async getDCASummary(@CurrentUser() user: JwtPayload) {
-    return this.telegramLoggerService.trackAction(
-      'Main balance (/transaction/dca-summary)',
-      user,
-      () => this.transactionService.getDCASummaryForUser(user.id),
-    );
+    return this.transactionService.getDCASummaryForUser(user.id);
   }
 }

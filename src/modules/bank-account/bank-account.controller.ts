@@ -57,7 +57,7 @@ export class BankAccountController {
   @RequireKyc()
   add(@CurrentUser() user: JwtPayload, @Body() body: AddBankAccountDto) {
     return this.telegramLogger.trackAction(
-      'Add Bank Account (/bank-accounts)',
+      '🏦 Bank account submitted',
       user,
       () => this.bankAccounts.submit(user.id, body),
     );
