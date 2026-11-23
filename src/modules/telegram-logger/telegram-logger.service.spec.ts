@@ -60,6 +60,62 @@ describe('TelegramLoggerService.logAlert', () => {
   });
 });
 
+describe('TelegramLoggerService routine logs', () => {
+  const fetchMock = jest.fn();
+  const sent = () =>
+    JSON.parse(
+      (fetchMock.mock.calls[0] as [string, { body: string }])[1].body,
+    ) as { text: string; link_preview_options?: { is_disabled: boolean } };
+
+  beforeEach(() => {
+    process.env.TELEGRAM_BOT_TOKEN = '123:abc';
+    process.env.LOG_GROUP_ID = '-100';
+    fetchMock.mockReset().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ result: { message_id: 1 } }),
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+  });
+
+  it('links the Telegram username and shows the app one as code, never as a mention', async () => {
+    await new TelegramLoggerService().logGenericAction('Buy', {
+      id: '42',
+      username: 'asa332',
+      tgUsername: 'dinesh2k21',
+    });
+    expect(sent().text).toBe(
+      '<b>Buy</b>\n' +
+        'Telegram: <a href="https://t.me/dinesh2k21">dinesh2k21</a>\n' +
+        'App user: <code>asa332</code>\n' +
+        'User ID: <b>#UID42</b>',
+    );
+    expect(sent().text).not.toContain('@');
+    expect(sent().link_preview_options).toEqual({ is_disabled: true });
+  });
+
+  it('keeps payment logs to an icon line, the details and the user last', async () => {
+    const service = new TelegramLoggerService();
+    await service.logNewTransaction(
+      '320049',
+      '25000.00',
+      '42',
+      'SUCCESS',
+      true,
+    );
+    expect(sent().text).toBe(
+      '💳 <b>New one-time buy</b> #BUY\n' +
+        'Payment: #TRX320049\n' +
+        'Amount: Rs. 25,000 · SUCCESS\n' +
+        'User ID: <b>#UID42</b>',
+    );
+  });
+
+  it('says so when either name is missing', async () => {
+    await new TelegramLoggerService().logGenericAction('Buy', { id: '42' });
+    expect(sent().text).toContain('Telegram: unknown\nApp user: not set');
+  });
+});
+
 describe('TelegramLoggerService log group limits', () => {
   const fetchMock = jest.fn();
   const ok = () =>

@@ -76,10 +76,8 @@ export class SellController {
     @CurrentUser() user: JwtPayload,
     @Param('id', new ParseUUIDPipe({ version: '4' })) id: string,
   ) {
-    return this.telegramLogger.trackAction(
-      'Sell sats (/sell/orders/:id/confirm)',
-      user,
-      () => this.sellService.confirm(user.id, id),
+    return this.telegramLogger.trackAction('💸 Sell sats', user, () =>
+      this.sellService.confirm(user.id, id),
     );
   }
 
