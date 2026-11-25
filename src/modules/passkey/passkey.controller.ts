@@ -10,6 +10,7 @@ import {
   NotFoundException,
   Param,
   ParseUUIDPipe,
+  Patch,
   Post,
   UseGuards,
 } from '@nestjs/common';
@@ -24,6 +25,7 @@ import { errorMessage } from '../../common/error-message';
 import { TelegramLoggerService } from '../telegram-logger/telegram-logger.service';
 import {
   ApprovalOptionsDto,
+  PasskeySettingsDto,
   RegisterPasskeyDto,
   UnlockDto,
 } from './dto/passkey.dto';
@@ -74,6 +76,25 @@ export class PasskeyController {
   ) {
     const status = await this.passkeys.register(user, body.response, body.name);
     this.logAction('🔐 Passkey added', user);
+    return status;
+  }
+
+  /**
+   * Whether the web app asks for the passkey when it opens (on by default).
+   * Turning it off needs an unlocked session. Sends and sale payments still
+   * need an approval each.
+   */
+  @Patch('settings')
+  @UseGuards(ConditionalAuthGuard, SessionRequiredGuard)
+  async settings(
+    @CurrentUser() user: RequestUser,
+    @Body() body: PasskeySettingsDto,
+  ) {
+    const status = await this.passkeys.setLockOnOpen(user, body.lock_on_open);
+    this.logAction(
+      `🔐 Passkey on app open turned ${body.lock_on_open ? 'on' : 'off'}`,
+      user,
+    );
     return status;
   }
 

@@ -9,6 +9,7 @@ import {
 } from './support/test-app';
 import { hashToken, UNLOCK_TTL_MS } from '../src/modules/auth/session.service';
 import { softPasskey, type SoftPasskey } from './support/soft-authenticator';
+import { PasskeyService } from '../src/modules/passkey/passkey.service';
 
 const ORIGIN = 'https://app.bitcoindeepa.test';
 const RP_ID = 'app.bitcoindeepa.test';
@@ -121,6 +122,7 @@ describe('Passkeys (e2e)', () => {
         enabled: false,
         unlocked: true,
         available: true,
+        lock_on_open: false,
         passkeys: [],
       });
       await removeBank(web).expect(404);
@@ -483,6 +485,125 @@ describe('Passkeys (e2e)', () => {
       await register(await webSession());
       const bank = await removeBank(legacy).expect(403);
       expect(bank.body.code).toBe('relogin_required');
+    });
+  });
+
+  describe('asking for the passkey when the app opens', () => {
+    const settings = (auth: Record<string, string>, lockOnOpen: unknown) =>
+      http()
+        .patch('/passkey/settings')
+        .set(auth)
+        .send({ lock_on_open: lockOnOpen });
+
+    it('is on once the first passkey is set, and the member can turn it off', async () => {
+      const web = await webSession();
+      const { status } = await register(web);
+      expect(status.lock_on_open).toBe(true);
+
+      const off = await settings(web, false).expect(200);
+      expect(off.body).toMatchObject({
+        enabled: true,
+        unlocked: true,
+        lock_on_open: false,
+      });
+      // Every session of the member sees the setting
+      const other = await webSession();
+      const seen = await http().get('/passkey').set(other).expect(200);
+      expect(seen.body).toMatchObject({ lock_on_open: false, unlocked: false });
+
+      const on = await settings(other, true).expect(200);
+      expect(on.body.lock_on_open).toBe(true);
+    });
+
+    it('still needs an approval for each send, and an unlock for bank accounts, when off', async () => {
+      const laptop = await webSession();
+      const { key } = await register(laptop);
+      await settings(laptop, false).expect(200);
+
+      const browser = await webSession();
+      const refused = await removeBank(browser).expect(403);
+      expect(refused.body.code).toBe('passkey_required');
+      const send = await http()
+        .post('/p2p/send')
+        .set(browser)
+        .send(sendBody)
+        .expect(403);
+      expect(send.body.code).toBe('passkey_approval_required');
+
+      const approval = await approve(browser, key, sendAction());
+      await http()
+        .post('/p2p/send')
+        .set({ ...browser, ...approval })
+        .send(sendBody)
+        .expect(200);
+    });
+
+    it('needs an unlocked session to turn it off, not to turn it on', async () => {
+      const laptop = await webSession();
+      const { key } = await register(laptop);
+      const browser = await webSession();
+
+      const refused = await settings(browser, false).expect(403);
+      expect(refused.body.code).toBe('passkey_required');
+      await settings(browser, true).expect(200);
+
+      await unlock(browser, key);
+      await settings(browser, false).expect(200);
+    });
+
+    it('rechecks the session when turning it off, not the lock read at sign-in', async () => {
+      const laptop = await webSession();
+      await register(laptop);
+      // A session that read as unlocked when it signed in, locked since then
+      // (e.g. the member's first passkey was added meanwhile)
+      const browser = await webSession();
+      const row = await ctx
+        .knex('user_session')
+        .where({ token_hash: hashToken(browser.Authorization.slice(7)) })
+        .first('id');
+      const stale = {
+        id: USER,
+        sessionId: row.id as string,
+        sessionKind: 'web' as const,
+        locked: false,
+      };
+      const passkeys = ctx.app.get(PasskeyService);
+      await expect(passkeys.setLockOnOpen(stale, false)).rejects.toMatchObject({
+        response: { code: 'passkey_required' },
+      });
+      const user = await ctx
+        .knex('user')
+        .where({ id: USER })
+        .first('passkey_lock_on_open');
+      expect(user.passkey_lock_on_open).toBe(true);
+    });
+
+    it('turns on again when the member sets a passkey after removing them all', async () => {
+      const web = await webSession();
+      const { status } = await register(web);
+      await settings(web, false).expect(200);
+      await http()
+        .delete(`/passkey/${status.passkeys[0].id}`)
+        .set(web)
+        .expect(200);
+
+      const none = await http().get('/passkey').set(web).expect(200);
+      expect(none.body.lock_on_open).toBe(false);
+      const again = await register(web);
+      expect(again.status.lock_on_open).toBe(true);
+    });
+
+    it('needs a passkey, a web session and a boolean', async () => {
+      const web = await webSession();
+      const none = await settings(web, true).expect(404);
+      expect(none.body.code).toBe('passkey_not_set');
+
+      await register(web);
+      await settings(web, 'no').expect(400);
+      await http().patch('/passkey/settings').set(web).send({}).expect(400);
+
+      const mini = await settings(miniApp(), false).expect(403);
+      expect(mini.body.code).toBe('passkey_unavailable');
     });
   });
 

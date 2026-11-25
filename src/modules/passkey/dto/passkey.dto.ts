@@ -1,4 +1,5 @@
 import {
+  IsBoolean,
   IsIn,
   IsInt,
   IsObject,
@@ -28,6 +29,12 @@ export class RegisterPasskeyDto {
   @Length(1, 64)
   @Matches(/^[^\p{C}]+$/u, { message: 'name has invalid characters' })
   name?: string;
+}
+
+export class PasskeySettingsDto {
+  /** Ask for the passkey each time the web app opens */
+  @IsBoolean()
+  lock_on_open!: boolean;
 }
 
 export class UnlockDto {
