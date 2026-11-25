@@ -46,7 +46,11 @@ export class ConditionalAuthGuard implements CanActivate {
 
     if (!isProduction && !enableAuth) {
       const mockUserId = process.env.MOCK_TG_ID || 'dev-user-123';
-      request.user = { id: mockUserId, username: 'dev-username' };
+      request.user = {
+        id: mockUserId,
+        username: 'dev-username',
+        tgUsername: 'dev_tg_username',
+      };
       this.logger.log(
         `Development mode: Authentication bypassed for mock user ${mockUserId}`,
       );
@@ -86,7 +90,8 @@ export class ConditionalAuthGuard implements CanActivate {
     // Legacy 7-day JWT (issued before sessions); removed once they expired
     try {
       const { id, username } = this.jwtService.verify<JwtPayload>(token);
-      return { id, username, sessionKind: 'legacy' };
+      // A legacy JWT carries the Telegram username, never the app's
+      return { id, tgUsername: username, sessionKind: 'legacy' };
     } catch (error) {
       this.logger.debug(`Legacy JWT rejected: ${errorMessage(error)}`);
       return null;

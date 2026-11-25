@@ -51,7 +51,7 @@ export class UserController {
     await this.userService.getUserOrThrow(user.id);
 
     return this.telegramLoggerService.trackAction(
-      'User Profile Completed',
+      '🪪 Profile completed',
       user,
       async () => {
         await this.userService.updateProfileDetails(user.id, updateProfileDto);
@@ -160,7 +160,7 @@ export class UserController {
     }
 
     return this.telegramLoggerService.trackAction(
-      'KYC Initiation',
+      '🪪 KYC started',
       user,
       async () => {
         const session = await this.diditService.createVerificationSession(
