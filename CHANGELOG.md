@@ -23,7 +23,7 @@ To release: add the version's section below, bump `version` in `package.json`, m
 - The PayHere webhook checks new `payment_id`s with PayHere before recording them, and settlement only pays `payment_id`s PayHere lists as `RECEIVED` with the recorded amount, so replayed notifications with invented `payment_id`s are never paid (#77)
 
 ### Upgrading
-- 1 new migration: `20261203000000_package_amount_decimal`, applied on startup in production (#79)
+- 1 new migration: `20261205000000_package_amount_decimal`, applied on startup in production (#79)
 
 ## [2.0.1] - 2026-11-20
 
