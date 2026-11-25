@@ -29,6 +29,7 @@ This is a NestJS-based backend service for the BitcoinDeepa DCA (Dollar Cost Ave
    - Login waits for the bot's `/init` at most 3 s (`LOGIN_INIT_TIMEOUT_MS`), then goes on with `walletLinked: false`. A web login revokes the browser's previous session cookie
    - Legacy `POST /auth/telegram` and `POST /auth/telegram-oidc` still mint 7-day JWTs until `LEGACY_JWT_ISSUE=false`, then answer 410. A legacy JWT is `sessionKind: 'legacy'`: it can read, but `SessionRequiredGuard` (on `/p2p/*` and `POST /sell/orders/:id/pay`) refuses it with 403 `relogin_required`, since it can't be revoked and never needed to spend before. Remove them, the legacy JWT path in the guard and `JWT_SECRET` 7 days after that flip
    - `@CurrentUser()` decorator for extracting user context
+   - **Passkeys** (`src/modules/passkey/`, `@simplewebauthn/server`, table `user_passkey`: public key, counter, transports, name): optional WebAuthn lock for the **web/PWA** app. RP ID = `WEBAUTHN_RP_ID`, else `APP_URL`'s host (changing it orphans every passkey); origins = `APP_URL`'s. User verification required (Face ID / fingerprint / device PIN); attestation `none`. Each prompt's challenge lives on the session (`user_session.webauthn_challenge*`, 5 min) and is taken in one `UPDATE` (single use, even when the response then fails). A web session of a member with a passkey is locked until it unlocks (`user_session.unlocked_at`, valid `UNLOCK_TTL_MS` = 12 h); the first passkey locks the member's other sessions. `PasskeyUnlockedGuard` (after `ConditionalAuthGuard`) refuses `POST /bank-accounts` and `DELETE /bank-accounts/:id` with 403 `passkey_required` while locked; a legacy JWT gets 403 `relogin_required` there once a passkey exists. **Sends and sale payments need a passkey approval each, on the web (mandatory)**: `PasskeyApprovalGuard` + `@RequirePasskeyApproval('p2p_send' | 'sell_pay')` on `POST /p2p/send` and `POST /sell/orders/:id/pay`. The app gets options from `POST /passkey/approve/options` (the challenge is stored with the action's key, `approval-action.ts`: recipient + amount + idempotency key, or the order id) and sends the WebAuthn response base64url-JSON in `X-Passkey-Assertion`; the guard rebuilds the key from the real request, so an approval works for that one action, once. No passkey → 403 `passkey_setup_required`; missing/used/other action → 403 `passkey_approval_required`; bad signature → 400 `passkey_not_verified`. A good approval also unlocks the session. Only web sessions with `APP_URL` set; Mini App sessions skip it. Paying a sale from the bot chat is Telegram's, not ours. **The Mini App is never locked and can't manage passkeys** (403 `passkey_unavailable`): Telegram's webview can't run WebAuthn for our domain (iOS WKWebView only allows the host app's associated domains), so there Telegram's own app passcode is the gate. Adding a second passkey or removing one needs an unlocked web session. Reads are never gated. A failed passkey is never 401 (the app signs out on 401). Lost phone: support checks who they are and calls `POST /passkey/admin-reset/:userId` (`x-admin-key`)
 
 2. **User Module** (`src/modules/user/`)
    - User profile management and creation
@@ -122,7 +123,8 @@ This is a NestJS-based backend service for the BitcoinDeepa DCA (Dollar Cost Ave
 
 **Tables:**
 - `package`: Subscription packages (UUID PK, name, frequency, amount, currency)
-- `user_session`: user-app sessions (SHA-256 of the token, `kind` web/miniapp, idle + absolute expiry, `revoked_at`)
+- `user_session`: user-app sessions (SHA-256 of the token, `kind` web/miniapp, idle + absolute expiry, `revoked_at`, `unlocked_at` = when it last unlocked with a passkey, `webauthn_challenge*` = its pending WebAuthn challenge)
+- `user_passkey`: WebAuthn passkeys (credential id, public key, counter, transports, name, last used)
 - `telegram_login_attempt`: web logins in progress (state hash, PKCE verifier, return path; single use, 10 min)
 - `user`: User profiles (Telegram ID as PK, `telegram_sub` (web OIDC sub, nullable unique), personal info, address, KYC status and verification data, `avatar_seed`, `username`: the member's own Bitcoin Deepa @username, unique, lower-case, CHECK `^[a-z][a-z0-9_]{2,19}$`, claimed once; `tg_username`: their Telegram username as Telegram sent it at the last login (Mini App `user.username`, web `preferred_username`, null when none; updated on every login, not unique, for ops logs only). On the request user these are `username` (app) and `tgUsername` (Telegram); a legacy JWT's username is the Telegram one)
 - `subscription`: Active subscriptions (PayHere sub ID as PK, user ID, package ID, is_active)
@@ -195,7 +197,8 @@ DATABASE_URL=postgresql://user:pass@localhost:5432/dbname
 
 # Telegram Authentication
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token
-APP_URL=https://app.example.com  # user app origin (credentialed CORS, cookie Origin check, login return); required in production
+APP_URL=https://app.example.com  # user app origin (credentialed CORS, cookie Origin check, login return, passkey origin); required in production
+WEBAUTHN_RP_ID=  # Optional: domain passkeys are bound to (default APP_URL's host); changing it orphans existing passkeys
 APP_COOKIE_SAME_SITE=  # dev/staging only: 'none' when the app and API are on different sites
 TELEGRAM_OIDC_CLIENT_ID=8219648988  # bot ID; required in production
 TELEGRAM_OIDC_CLIENT_SECRET=...  # BotFather > Login Widget; required in production
@@ -275,6 +278,15 @@ PORT=3000
 - `GET /auth/me` - current user and session kind (authenticated)
 - `POST /auth/logout`, `POST /auth/logout-all` - revoke this session / every session (authenticated)
 - Legacy: `POST /auth/telegram`, `POST /auth/telegram-oidc` - 7-day JWT; 410 once `LEGACY_JWT_ISSUE=false`
+
+### Passkeys (web/PWA only)
+- `GET /passkey` - `{ enabled, unlocked, available, passkeys: [{ id, name, created_at, last_used_at }] }` for this session (`available` = a web session and `APP_URL` set)
+- `POST /passkey/register/options` → creation options; `POST /passkey/register { response, name? }` - add one (unlocks this session). With one already, needs an unlocked session
+- `POST /passkey/unlock/options` → request options; `POST /passkey/unlock { response }` - unlock this session
+- `POST /passkey/approve/options { action: 'p2p_send', to_telegram_id, amount, idempotency_key }` or `{ action: 'sell_pay', order_id }` → request options for one approval (send the response in `X-Passkey-Assertion` with that request)
+- `DELETE /passkey/:id` - remove one (unlocked web session); the last one turns the lock off
+- `POST /passkey/admin-reset/:userId` - support removes all of a member's passkeys (`x-admin-key`; 404 when none)
+- Codes: `passkey_unavailable` (403 Mini App, 503 no `APP_URL`), `passkey_required` (403), `challenge_expired`, `passkey_not_verified`, `passkey_exists`, `passkey_limit` (400, max 10), `passkey_not_set` (404), `passkey_setup_required` / `passkey_approval_required` (403, sends and sale payments). Legacy JWT: 403 `relogin_required`
 
 ### User Management
 - `POST /user` - Complete profile (email, phone, address, city, country) for the already-registered user (authenticated)

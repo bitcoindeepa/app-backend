@@ -6,6 +6,7 @@ import { ConditionalAuthGuard } from './conditional-auth.guard';
 import { AdminKeyGuard } from './admin-key.guard';
 import { SessionService } from './session.service';
 import { SessionRequiredGuard } from './session-required.guard';
+import { PasskeyUnlockedGuard } from './passkey-unlocked.guard';
 import { UserModule } from '../user/user.module';
 
 /**
@@ -31,6 +32,7 @@ import { UserModule } from '../user/user.module';
     AdminKeyGuard,
     SessionService,
     SessionRequiredGuard,
+    PasskeyUnlockedGuard,
   ],
   exports: [
     AuthService,
@@ -39,6 +41,7 @@ import { UserModule } from '../user/user.module';
     JwtModule,
     SessionService,
     SessionRequiredGuard,
+    PasskeyUnlockedGuard,
   ],
 })
 export class AuthModule {}

@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { PasskeyModule } from '../passkey/passkey.module';
 import { KnexModule } from '../knex/knex.module';
 import { AuthModule } from '../auth/auth.module';
 import { UserModule } from '../user/user.module';
@@ -23,6 +24,7 @@ import { SellController } from './sell.controller';
     CeyPayModule,
     BankAccountModule,
     TelegramLoggerModule,
+    PasskeyModule,
     P2pModule,
   ],
   controllers: [SellController],

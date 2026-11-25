@@ -12,6 +12,7 @@ import {
 } from '@nestjs/common';
 import { ConditionalAuthGuard } from '../auth/conditional-auth.guard';
 import { KycVerifiedGuard } from '../auth/kyc-verified.guard';
+import { PasskeyUnlockedGuard } from '../auth/passkey-unlocked.guard';
 import { RequireKyc } from '../auth/require-kyc.decorator';
 import { CurrentUser } from '../auth/user.decorator';
 import type { JwtPayload } from '../auth/auth.service';
@@ -53,7 +54,7 @@ export class BankAccountController {
 
   /** Step 2: submit the account for admin review. */
   @Post()
-  @UseGuards(SellEnabledGuard, KycVerifiedGuard)
+  @UseGuards(SellEnabledGuard, KycVerifiedGuard, PasskeyUnlockedGuard)
   @RequireKyc()
   add(@CurrentUser() user: JwtPayload, @Body() body: AddBankAccountDto) {
     return this.telegramLogger.trackAction(
@@ -64,6 +65,7 @@ export class BankAccountController {
   }
 
   @Delete(':id')
+  @UseGuards(PasskeyUnlockedGuard)
   @HttpCode(HttpStatus.NO_CONTENT)
   async remove(
     @CurrentUser() user: JwtPayload,

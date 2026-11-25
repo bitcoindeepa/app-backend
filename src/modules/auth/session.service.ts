@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { createHash, randomBytes } from 'crypto';
+import type { Knex } from 'knex';
 import { KnexService } from '../knex/knex.service';
 import type { JwtPayload } from './auth.service';
 
@@ -26,7 +27,34 @@ export const SESSION_POLICY: Record<
 export interface SessionUser extends JwtPayload {
   sessionId: string;
   sessionKind: SessionKind;
+  /**
+   * A web session of a member with a passkey that hasn't unlocked with it
+   * (or not within UNLOCK_TTL_MS). PasskeyUnlockedGuard refuses
+   * money-moving routes while it's true. Never true for the Mini App, where
+   * passkeys can't run (Telegram's webview).
+   */
+  locked: boolean;
 }
+
+/** How long an unlocked web session may move money before unlocking again */
+export const UNLOCK_TTL_MS = 12 * HOUR;
+
+/** Whether a session is locked, from its kind and when it last unlocked */
+export const isSessionLocked = (
+  kind: SessionKind,
+  hasPasskey: boolean,
+  unlockedAt: Date | string | null,
+  now = Date.now(),
+): boolean =>
+  kind === 'web' &&
+  hasPasskey &&
+  (!unlockedAt || now - new Date(unlockedAt).getTime() > UNLOCK_TTL_MS);
+
+/** register/unlock: settings and the lock; approve: one send or sale payment */
+export type ChallengeKind = 'register' | 'unlock' | 'approve';
+
+/** A pending WebAuthn challenge lives this long (the browser prompt's timeout) */
+export const CHALLENGE_TTL_MS = 5 * 60 * 1000;
 
 export interface CreatedSession {
   token: string;
@@ -43,6 +71,8 @@ interface SessionRow {
   absolute_expires_at: Date;
   username: string | null;
   tg_username: string | null;
+  unlocked_at: Date | null;
+  has_passkey: boolean;
 }
 
 export const hashToken = (token: string): Buffer =>
@@ -110,7 +140,7 @@ export class SessionService {
       .where('s.absolute_expires_at', '>', now)
       .first<
         SessionRow | undefined
-      >('s.id', 's.user_id', 's.kind', 's.last_seen_at', 's.absolute_expires_at', 'u.username', 'u.tg_username');
+      >('s.id', 's.user_id', 's.kind', 's.last_seen_at', 's.absolute_expires_at', 'u.username', 'u.tg_username', 's.unlocked_at', this.knex.raw('exists (select 1 from user_passkey p where p.user_id = s.user_id) as has_passkey'));
     if (!row) return null;
 
     const policy = SESSION_POLICY[row.kind];
@@ -139,7 +169,90 @@ export class SessionService {
       tgUsername: row.tg_username ?? undefined,
       sessionId: row.id,
       sessionKind: row.kind,
+      locked: isSessionLocked(
+        row.kind,
+        row.has_passkey,
+        row.unlocked_at,
+        now.getTime(),
+      ),
     };
+  }
+
+  /** This session just unlocked with a passkey (in `trx` when given) */
+  async markUnlocked(sessionId: string, trx?: Knex.Transaction): Promise<void> {
+    await (trx ?? this.knex)('user_session')
+      .where({ id: sessionId })
+      .update({ unlocked_at: new Date() });
+  }
+
+  /**
+   * Lock every other session of the user (their first passkey: a session
+   * unlocked under an earlier, since removed passkey mustn't stay unlocked)
+   */
+  async lockOtherSessions(
+    userId: string,
+    exceptSessionId: string,
+    trx?: Knex.Transaction,
+  ): Promise<void> {
+    await (trx ?? this.knex)('user_session')
+      .where({ user_id: userId })
+      .whereNot({ id: exceptSessionId })
+      .whereNotNull('unlocked_at')
+      .update({ unlocked_at: null });
+  }
+
+  /**
+   * Remember the session's pending WebAuthn challenge (replaces any earlier
+   * one: only the latest prompt can complete)
+   */
+  async setChallenge(
+    sessionId: string,
+    kind: ChallengeKind,
+    challenge: string,
+    action: string | null = null,
+  ): Promise<void> {
+    await this.knex('user_session')
+      .where({ id: sessionId })
+      .update({
+        webauthn_challenge: challenge,
+        webauthn_challenge_kind: kind,
+        webauthn_challenge_action: action,
+        webauthn_challenge_expires_at: new Date(Date.now() + CHALLENGE_TTL_MS),
+      });
+  }
+
+  /**
+   * Take the session's pending challenge of this kind (and the action it
+   * approves), if it hasn't expired. Single use: it's cleared in the same
+   * statement, so a response can't be replayed and two requests can't both
+   * use it.
+   */
+  async takeChallenge(
+    sessionId: string,
+    kind: ChallengeKind,
+  ): Promise<{ challenge: string; action: string | null } | null> {
+    // RETURNING shows the new (null) value, so read the old one through a
+    // locked subquery
+    const result = await this.knex.raw<{
+      rows: { challenge: string; action: string | null }[];
+    }>(
+      `UPDATE user_session s
+          SET webauthn_challenge = NULL,
+              webauthn_challenge_kind = NULL,
+              webauthn_challenge_action = NULL,
+              webauthn_challenge_expires_at = NULL
+         FROM (SELECT id, webauthn_challenge, webauthn_challenge_action
+                 FROM user_session
+                WHERE id = ? FOR UPDATE) old
+        WHERE s.id = old.id
+          AND s.webauthn_challenge_kind = ?
+          AND s.webauthn_challenge IS NOT NULL
+          AND s.webauthn_challenge_expires_at > now()
+    RETURNING old.webauthn_challenge AS challenge,
+              old.webauthn_challenge_action AS action`,
+      [sessionId, kind],
+    );
+    return result.rows[0] ?? null;
   }
 
   async revoke(sessionId: string): Promise<void> {
