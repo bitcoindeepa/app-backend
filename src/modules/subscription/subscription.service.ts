@@ -161,7 +161,6 @@ export class SubscriptionService {
       await trx('subscription')
         .update({
           is_active: false,
-          updated_at: this.knexService.knex.fn.now(),
         })
         .where('payhere_sub_id', payhere_sub_id);
 

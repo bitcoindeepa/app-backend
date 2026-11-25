@@ -714,7 +714,7 @@ export class TransactionService {
         }
         if (subscriptionEnded && subscription.is_active) {
           await trx('subscription')
-            .update({ is_active: false, updated_at: trx.fn.now() })
+            .update({ is_active: false })
             .where('payhere_sub_id', subscription_id);
           alerts.push(
             `PayHere ended subscription ${subscription_id} (user ${userId}): message_type=${message_type ?? '-'}, item_rec_status=${item_rec_status ?? '-'}. Marked inactive.`,
@@ -1154,7 +1154,7 @@ export class TransactionService {
       );
     }
     await trx('subscription')
-      .update({ payhere_order_id: null, updated_at: trx.fn.now() })
+      .update({ payhere_order_id: null })
       .where('payhere_sub_id', other.payhere_sub_id);
     this.logger.warn(
       `order_id ${order_id} moved from never-paid subscription ${other.payhere_sub_id} to ${subscription_id} (checkout retry)`,
@@ -1205,7 +1205,7 @@ export class TransactionService {
     }
 
     await trx('subscription')
-      .update({ is_active: true, updated_at: trx.fn.now() })
+      .update({ is_active: true })
       .where('payhere_sub_id', subscription.payhere_sub_id);
     this.logger.log(
       `Subscription ${subscription.payhere_sub_id} activated by first successful payment ${payment_id}`,
