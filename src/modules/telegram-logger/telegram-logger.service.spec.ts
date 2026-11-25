@@ -90,6 +90,23 @@ describe('TelegramLoggerService.logAlert', () => {
     );
   });
 
+  it('cuts the plain fallback to Telegram 4096 characters, keeping the heading and fields', async () => {
+    fetchMock.mockImplementationOnce(() => refused(400));
+    await new TelegramLoggerService().logAlert(
+      'Waiting for review',
+      `reason: ${'<&>'.repeat(3000)}`,
+      { fields: [['User', '#UID42']] },
+    );
+    const text = call(1).body.text ?? '';
+    expect(text.length).toBeLessThanOrEqual(4096);
+    expect(text.startsWith('⚠️ <b>Waiting for review</b>\nreason: ')).toBe(
+      true,
+    );
+    expect(text.endsWith('…\nUser: #UID42')).toBe(true);
+    // never cut inside an entity
+    expect(text).not.toMatch(/&(?!amp;|lt;|gt;)/);
+  });
+
   it('stops trying rich messages once the Bot API says it has no such method', async () => {
     const service = new TelegramLoggerService();
     fetchMock.mockImplementationOnce(() => refused(404));

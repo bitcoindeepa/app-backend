@@ -31,6 +31,39 @@ const NO_LINK_PREVIEW = { is_disabled: true };
 /** Alerts held while rate limited, sent when the pause ends */
 const MAX_QUEUED_ALERTS = 20;
 
+/** Telegram refuses a sendMessage text longer than this */
+export const TELEGRAM_MAX_TEXT_LENGTH = 4096;
+
+/** At most `max` characters (an ellipsis included when cut), never splitting a character */
+export function truncateText(text: string, max: number): string {
+  if (text.length <= max) return text;
+  if (max <= 0) return '';
+  let out = '';
+  for (const ch of text) {
+    if (out.length + ch.length > max - 1) break;
+    out += ch;
+  }
+  return `${out}…`;
+}
+
+/**
+ * `text` escaped, cut so the escaped form is at most `max` characters
+ * (counted escaped, which is never less than what Telegram counts), so a cut
+ * never lands inside an entity
+ */
+function escapeWithin(text: string, max: number): string {
+  const escaped = escapeHtml(text);
+  if (escaped.length <= max) return escaped;
+  if (max <= 0) return '';
+  let out = '';
+  for (const ch of text) {
+    const e = escapeHtml(ch);
+    if (out.length + e.length > max - 1) break;
+    out += e;
+  }
+  return `${out}…`;
+}
+
 /** A log-group call: its result, or whether it failed only because of rate limits */
 type CallResult =
   | { ok: true; result: { message_id?: number } | true }
@@ -220,13 +253,21 @@ export class TelegramLoggerService {
           )
           .join('')}</table>`
       : '';
+    // The plain fallback must fit Telegram's text limit whatever `text` holds
+    // (error messages, stored reasons): `text` gets what the rest leaves
+    const plainHead = `${icon} <b>${heading}</b>`;
+    const plainFields = fields.map(
+      (f) => `${escapeHtml(f[0])}: ${fieldValue(f)}`,
+    );
+    const textBudget =
+      TELEGRAM_MAX_TEXT_LENGTH -
+      [plainHead, ...plainFields].join('\n').length -
+      1;
     const message: Alert = {
       rich: `<h3>${icon} ${heading}</h3>${details.richHtml ?? richParagraphs(text)}${table}`,
-      plain: [
-        `${icon} <b>${heading}</b>`,
-        escapeHtml(text),
-        ...fields.map((f) => `${escapeHtml(f[0])}: ${fieldValue(f)}`),
-      ].join('\n'),
+      plain: [plainHead, escapeWithin(text, textBudget), ...plainFields].join(
+        '\n',
+      ),
     };
     if (!this.isConfigured()) {
       this.logger.error(`ALERT (${source}): ${text}`);

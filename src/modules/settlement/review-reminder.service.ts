@@ -3,7 +3,10 @@ import { Cron } from '@nestjs/schedule';
 import type { Knex } from 'knex';
 import { KnexService } from '../knex/knex.service';
 import { RedisService } from '../redis/redis.service';
-import { TelegramLoggerService } from '../telegram-logger/telegram-logger.service';
+import {
+  TelegramLoggerService,
+  truncateText,
+} from '../telegram-logger/telegram-logger.service';
 import { errorMessage } from '../../common/error-message';
 import { escapeHtml } from '../../common/escape-html';
 import { SellStatus } from '../sell/sell.constants';
@@ -23,6 +26,19 @@ const MIN_AGE_MINUTES = 30;
 const BUY_MAX_AGE_DAYS = 7;
 /** Rows listed per group (Telegram messages are capped at 4096 characters) */
 const LISTED_PER_GROUP = 8;
+/**
+ * Reasons are unbounded text (upstream error messages): cut them so every
+ * group still fits. 3 groups x 8 lines with a 60-character reason stay well
+ * under Telegram's 4096 characters in the plain fallback (logAlert also cuts
+ * the whole text to fit, but that would drop the last groups); the rich
+ * table has room for more
+ */
+const PLAIN_REASON_CHARS = 60;
+const RICH_REASON_CHARS = 200;
+const plainReason = (reason: string | null) =>
+  reason ? ` - ${truncateText(reason, PLAIN_REASON_CHARS)}` : '';
+const richReason = (reason: string | null) =>
+  truncateText(reason ?? '', RICH_REASON_CHARS);
 
 interface Group {
   /** Short name, the rich message's section heading */
@@ -152,7 +168,7 @@ export class ReviewReminderService {
       lines: rows.map(
         (row) =>
           `${row.id}: ${num(row.sats)} sats for ${row.amount_lkr} LKR, #UID${row.user_id}` +
-          (row.failure_reason ? ` - ${row.failure_reason}` : ''),
+          plainReason(row.failure_reason),
       ),
       columns: ['Order', 'Sats', 'LKR', 'User', 'Reason'],
       rows: rows.map((row) => [
@@ -160,7 +176,7 @@ export class ReviewReminderService {
         num(row.sats),
         row.amount_lkr,
         `#UID${row.user_id}`,
-        row.failure_reason ?? '',
+        richReason(row.failure_reason),
       ]),
     };
   }
@@ -190,14 +206,15 @@ export class ReviewReminderService {
       total: await this.count(query()),
       lines: rows.map(
         (row) =>
-          `${row.payhere_pay_id}: ${row.gross_amount ?? '?'} LKR, #UID${row.user_id ?? '?'} - ${row.hold_reason}`,
+          `${row.payhere_pay_id}: ${row.gross_amount ?? '?'} LKR, #UID${row.user_id ?? '?'}` +
+          plainReason(row.hold_reason),
       ),
       columns: ['Payment', 'LKR', 'User', 'Reason'],
       rows: rows.map((row) => [
         row.payhere_pay_id,
         row.gross_amount ?? '?',
         `#UID${row.user_id ?? '?'}`,
-        row.hold_reason,
+        richReason(row.hold_reason),
       ]),
     };
   }
@@ -237,16 +254,22 @@ export class ReviewReminderService {
       lines: rows.map(
         (row) =>
           `${row.payhere_pay_id}: ${num(row.satoshis_purchased)} sats, #UID${row.user_id ?? '?'}` +
-          (row.settlement_failure
-            ? ` - ${describeFailure(row.settlement_failure)}`
-            : ''),
+          plainReason(
+            row.settlement_failure
+              ? describeFailure(row.settlement_failure)
+              : null,
+          ),
       ),
       columns: ['Payment', 'Sats', 'User', 'Reason'],
       rows: rows.map((row) => [
         row.payhere_pay_id,
         num(row.satoshis_purchased),
         `#UID${row.user_id ?? '?'}`,
-        row.settlement_failure ? describeFailure(row.settlement_failure) : '',
+        richReason(
+          row.settlement_failure
+            ? describeFailure(row.settlement_failure)
+            : null,
+        ),
       ]),
     };
   }
