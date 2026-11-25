@@ -9,6 +9,7 @@ import {
 } from './support/test-app';
 import { hashToken, UNLOCK_TTL_MS } from '../src/modules/auth/session.service';
 import { softPasskey, type SoftPasskey } from './support/soft-authenticator';
+import { PasskeyService } from '../src/modules/passkey/passkey.service';
 
 const ORIGIN = 'https://app.bitcoindeepa.test';
 const RP_ID = 'app.bitcoindeepa.test';
@@ -548,6 +549,33 @@ describe('Passkeys (e2e)', () => {
 
       await unlock(browser, key);
       await settings(browser, false).expect(200);
+    });
+
+    it('rechecks the session when turning it off, not the lock read at sign-in', async () => {
+      const laptop = await webSession();
+      await register(laptop);
+      // A session that read as unlocked when it signed in, locked since then
+      // (e.g. the member's first passkey was added meanwhile)
+      const browser = await webSession();
+      const row = await ctx
+        .knex('user_session')
+        .where({ token_hash: hashToken(browser.Authorization.slice(7)) })
+        .first('id');
+      const stale = {
+        id: USER,
+        sessionId: row.id as string,
+        sessionKind: 'web' as const,
+        locked: false,
+      };
+      const passkeys = ctx.app.get(PasskeyService);
+      await expect(passkeys.setLockOnOpen(stale, false)).rejects.toMatchObject({
+        response: { code: 'passkey_required' },
+      });
+      const user = await ctx
+        .knex('user')
+        .where({ id: USER })
+        .first('passkey_lock_on_open');
+      expect(user.passkey_lock_on_open).toBe(true);
     });
 
     it('turns on again when the member sets a passkey after removing them all', async () => {

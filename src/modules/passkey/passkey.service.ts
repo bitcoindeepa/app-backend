@@ -129,13 +129,28 @@ export class PasskeyService {
   ): Promise<PasskeyStatus> {
     this.webOnly(user);
     if (!enabled) this.assertUnlocked(user);
-    const updated = await this.knex('user')
-      .where('id', user.id)
-      .whereExists(
-        this.knex('user_passkey').select(1).where('user_id', user.id),
-      )
-      .update({ passkey_lock_on_open: enabled });
-    if (!updated) throw this.noPasskeys();
+    // Under the member's user row lock, like register() and remove(): the
+    // lock state read at authentication may be stale (a first passkey added
+    // since then locks this session), so turning it off rechecks the session
+    // as committed now
+    await this.knex.transaction(async (trx) => {
+      await trx('user').where('id', user.id).forNoKeyUpdate().first('id');
+      const passkey = await trx('user_passkey')
+        .where({ user_id: user.id })
+        .first<{ id: string } | undefined>('id');
+      if (!passkey) throw this.noPasskeys();
+      if (!enabled) {
+        const session = await trx('user_session')
+          .where({ id: user.sessionId })
+          .first<{ unlocked_at: Date | null } | undefined>('unlocked_at');
+        if (isSessionLocked('web', true, session?.unlocked_at ?? null)) {
+          throw this.locked();
+        }
+      }
+      await trx('user')
+        .where('id', user.id)
+        .update({ passkey_lock_on_open: enabled });
+    });
     this.logger.log(
       `Passkey lock on open turned ${enabled ? 'on' : 'off'} for user ${user.id}`,
     );
