@@ -291,9 +291,13 @@ export class SessionService {
       .orWhere('absolute_expires_at', '<', now)
       .orWhere('revoked_at', '<', weekAgo)
       .del();
-    const attempts = await this.knex('telegram_login_attempt')
-      .where('expires_at', '<', now)
-      .del();
+    const attempts =
+      (await this.knex('telegram_login_attempt')
+        .where('expires_at', '<', now)
+        .del()) +
+      (await this.knex('passkey_login_attempt')
+        .where('expires_at', '<', now)
+        .del());
     return { sessions, attempts };
   }
 }

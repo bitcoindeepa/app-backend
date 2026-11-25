@@ -20,7 +20,11 @@ import {
   type VerifiedRegistrationResponse,
 } from '@simplewebauthn/server';
 import { KnexService } from '../knex/knex.service';
-import { isSessionLocked, SessionService } from '../auth/session.service';
+import {
+  CHALLENGE_TTL_MS,
+  isSessionLocked,
+  SessionService,
+} from '../auth/session.service';
 import type { RequestWithUser } from '../auth/conditional-auth.guard';
 import { errorMessage } from '../../common/error-message';
 import { relyingParty, type RelyingParty } from './passkey-config';
@@ -337,7 +341,16 @@ export class PasskeyService {
       .first<PasskeyRow | undefined>();
     // Someone else's passkey, or one that was removed
     if (!row) throw this.notVerified();
+    await this.checkAssertion(row, rp, challenge, response);
+  }
 
+  /** Verify an assertion against a stored passkey; bumps its counter */
+  private async checkAssertion(
+    row: PasskeyRow,
+    rp: RelyingParty,
+    challenge: string,
+    response: AuthenticationResponseJSON,
+  ): Promise<void> {
     let verified: VerifiedAuthenticationResponse;
     try {
       verified = await verifyAuthenticationResponse({
@@ -355,7 +368,7 @@ export class PasskeyService {
       });
     } catch (error) {
       this.logger.warn(
-        `Passkey assertion refused for user ${user.id}: ${errorMessage(error)}`,
+        `Passkey assertion refused for user ${row.user_id}: ${errorMessage(error)}`,
       );
       throw this.notVerified();
     }
@@ -371,6 +384,60 @@ export class PasskeyService {
         ]),
         last_used_at: new Date(),
       });
+  }
+
+  /**
+   * Options for "Sign in with passkey" on the web login screen: no user yet,
+   * so any of the member's passkeys for this site can answer (discoverable
+   * credentials; the browser lists them). The challenge is stored as a
+   * login attempt (5 min, single use).
+   */
+  async loginOptions(): Promise<{
+    attempt_id: string;
+    options: PublicKeyCredentialRequestOptionsJSON;
+  }> {
+    const rp = relyingParty();
+    if (!rp) throw this.unavailable();
+    const options = await generateAuthenticationOptions({
+      rpID: rp.id,
+      userVerification: 'required',
+    });
+    const [row] = await this.knex('passkey_login_attempt')
+      .insert({
+        challenge: options.challenge,
+        expires_at: new Date(Date.now() + CHALLENGE_TTL_MS),
+      })
+      .returning<{ id: string }[]>('id');
+    return { attempt_id: row.id, options };
+  }
+
+  /**
+   * Check a login response: the attempt is taken first (single use), then
+   * the passkey is found by its credential id (unique across members) and
+   * its signature checked. Returns whose passkey it is.
+   */
+  async login(
+    attemptId: string,
+    response: AuthenticationResponseJSON,
+  ): Promise<string> {
+    const rp = relyingParty();
+    if (!rp) throw this.unavailable();
+    const credentialId = this.credentialId(response);
+    const [attempt] = await this.knex('passkey_login_attempt')
+      .where({ id: attemptId })
+      .where('expires_at', '>', new Date())
+      .del()
+      .returning<{ challenge: string }[]>('challenge');
+    if (!attempt) throw this.challengeExpired();
+
+    const row = await this.knex('user_passkey')
+      .where({ credential_id: credentialId })
+      .first<PasskeyRow | undefined>();
+    // A passkey we don't know (removed, or another site's)
+    if (!row) throw this.notVerified();
+    await this.checkAssertion(row, rp, attempt.challenge, response);
+    this.logger.log(`Passkey login for user ${row.user_id}`);
+    return row.user_id;
   }
 
   /** Remove one (an unlocked web session only); the last one turns the lock off */
@@ -463,6 +530,13 @@ export class PasskeyService {
     return new ForbiddenException({
       code: 'passkey_approval_required',
       message: 'Approve this with your passkey.',
+    });
+  }
+
+  private unavailable() {
+    return new ServiceUnavailableException({
+      code: 'passkey_unavailable',
+      message: 'Passkeys are not set up on this server.',
     });
   }
 

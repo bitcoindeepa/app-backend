@@ -6,6 +6,7 @@ import { RedisService } from '../redis/redis.service';
  * which the app calls all the time.
  * - start/callback: per client IP (req.ip, real once TRUST_PROXY matches the
  *   proxies in front of us)
+ * - passkey: the web's "Sign in with passkey" (options + login), per IP
  * - miniapp: runs on every Mini App launch and mobile carriers put many users
  *   behind one IP (CGNAT), so the IP limit is loose and the real limit is
  *   per Telegram user, counted after initData is verified
@@ -15,6 +16,7 @@ export const AUTH_RATE_LIMITS = {
   callback: 20,
   miniapp: 120,
   miniappUser: 10,
+  passkey: 30,
 } as const;
 
 export type AuthRateLimitBucket = keyof typeof AUTH_RATE_LIMITS;

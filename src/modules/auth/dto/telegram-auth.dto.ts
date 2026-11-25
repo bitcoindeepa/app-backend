@@ -1,10 +1,13 @@
 import {
   IsNotEmpty,
+  IsObject,
   IsOptional,
   IsString,
+  IsUUID,
   Matches,
   MaxLength,
 } from 'class-validator';
+import type { AuthenticationResponseJSON } from '@simplewebauthn/server';
 
 export class TelegramAuthDto {
   @IsString()
@@ -32,4 +35,13 @@ export class TelegramMiniAppLoginDto {
     message: 'referral_code must be 1-64 letters, digits, _ or -',
   })
   referral_code?: string;
+}
+
+/** POST /auth/passkey/login: the attempt from /auth/passkey/options and the browser's answer */
+export class PasskeyLoginDto {
+  @IsUUID('4')
+  attempt_id!: string;
+
+  @IsObject()
+  response!: AuthenticationResponseJSON;
 }

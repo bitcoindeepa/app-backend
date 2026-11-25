@@ -16,6 +16,7 @@ import {
 import type { Request, Response } from 'express';
 import { AuthService, JwtPayload } from './auth.service';
 import {
+  PasskeyLoginDto,
   TelegramAuthDto,
   TelegramMiniAppLoginDto,
   TelegramOidcAuthDto,
@@ -43,6 +44,7 @@ import { CurrentUser } from './user.decorator';
 import { P2pService, type P2pLoginCredential } from '../p2p/p2p.service';
 import { isP2pEnabled } from '../../common/p2p-enabled';
 import { errorMessage } from '../../common/error-message';
+import { PasskeyService } from '../passkey/passkey.service';
 
 interface TelegramUser {
   id: number;
@@ -80,6 +82,7 @@ export class AuthController {
     private readonly oidc: TelegramOidcService,
     private readonly p2p: P2pService,
     private readonly rateLimiter: AuthRateLimiter,
+    private readonly passkeys: PasskeyService,
   ) {}
 
   // ---- Web: Log In with Telegram (OIDC redirect + PKCE) ----
@@ -156,6 +159,53 @@ export class AuthController {
     } catch (err) {
       this.loginFailed(res, err);
     }
+  }
+
+  // ---- Web: Sign in with passkey (a member who added one in settings) ----
+
+  /** Options for the browser's passkey prompt, with the attempt to answer */
+  @Post('passkey/options')
+  @HttpCode(HttpStatus.OK)
+  async passkeyLoginOptions(@Req() req: Request) {
+    await this.rateLimiter.hit('passkey', clientIp(req));
+    return this.passkeys.loginOptions();
+  }
+
+  /**
+   * Check the passkey and start a web session (cookie), like the Telegram
+   * web login. The session starts unlocked: the member just used their
+   * passkey. No Telegram credential here, so the bot wallet link isn't
+   * renewed (it lasts a year from the last Telegram login; when it has run
+   * out, wallet calls answer 403 relogin_required).
+   */
+  @Post('passkey/login')
+  @HttpCode(HttpStatus.OK)
+  async passkeyLogin(
+    @Body() body: PasskeyLoginDto,
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    await this.rateLimiter.hit('passkey', clientIp(req));
+    const telegramId = await this.passkeys.login(
+      body.attempt_id,
+      body.response,
+    );
+
+    // This browser's previous session ends here, as with the Telegram login
+    const previous = readCookie(req, sessionCookieName());
+    if (previous) await this.sessions.revokeToken(previous);
+    const session = await this.sessions.create(telegramId, 'web', {
+      userAgent: req.header('user-agent'),
+      ip: req.ip,
+    });
+    await this.sessions.markUnlocked(session.sessionId);
+    res.cookie(
+      sessionCookieName(),
+      session.token,
+      cookieOptions(SESSION_POLICY.web.absoluteMs),
+    );
+    this.logger.log(`Passkey web login for user ${telegramId}`);
+    return { user: { telegram_id: telegramId } };
   }
 
   // ---- Mini App: initData exchanged once at launch ----
