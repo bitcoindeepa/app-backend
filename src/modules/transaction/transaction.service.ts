@@ -21,7 +21,12 @@ import { BitcoinPriceService } from '../bitcoin-price/bitcoin-price.service';
 import { RedisService } from '../redis/redis.service';
 import { CacheKeys } from '../redis/utils/cache-keys.util';
 import { TelegramLoggerService } from '../telegram-logger/telegram-logger.service';
-import { BitcoinDeepaService } from '../bitcoindeepa/bitcoindeepa.service';
+import {
+  BitcoinDeepaService,
+  type UserBalancePot,
+  potSats,
+  spendableSats,
+} from '../bitcoindeepa/bitcoindeepa.service';
 import { PayHereService, payHereErrorDetail } from '../payhere/payhere.service';
 import { PayHereNotificationDto } from './dto/payhere-notification.dto';
 import { errorMessage } from '../../common/error-message';
@@ -109,6 +114,15 @@ export interface DcaSummary {
   total_lkr: string;
   /** False when the BitcoinDeepa wallet balance couldn't be fetched (total_* are then 0, not real) */
   balance_available: boolean;
+  /**
+   * Sats the member can move (sell, send): `total_balance` minus pots.
+   * `total_balance` is the whole wallet, pots included.
+   */
+  spendable_balance: number;
+  /** Sats locked in the member's savings pots in the bot (can't be moved until withdrawn there) */
+  pot_balance: number;
+  /** Each savings pot (name, sats), oldest first; [] when none */
+  pots: UserBalancePot[];
   currency: string;
   '24_hr_change': number;
   current_btc_price?: {
@@ -1815,6 +1829,9 @@ export class TransactionService {
     let total_balance = 0;
     let total_lkr = '0.00';
     let balance_available = false;
+    let spendable_balance = 0;
+    let pot_balance = 0;
+    let pots: UserBalancePot[] = [];
     if (this.bitcoinDeepaService.isConfigured()) {
       const balance = await this.bitcoinDeepaService.getUserBalance(
         parseInt(user_id, 10),
@@ -1823,6 +1840,9 @@ export class TransactionService {
         total_balance = balance.balance ?? 0;
         total_lkr = balance.balance_lkr ?? '0.00';
         balance_available = true;
+        spendable_balance = spendableSats(balance) ?? 0;
+        pot_balance = potSats(balance);
+        pots = Array.isArray(balance.pots) ? balance.pots : [];
       }
     }
 
@@ -1837,6 +1857,9 @@ export class TransactionService {
       total_balance,
       total_lkr,
       balance_available,
+      spendable_balance,
+      pot_balance,
+      pots,
       '24_hr_change': change24h ?? 0,
       current_btc_price: rate
         ? { usd: rate.btcUsd, lkr: rate.btcLkr }
