@@ -249,7 +249,7 @@ export class BankAccountService {
             'id',
             rejectedSame.map((a) => a.id),
           )
-          .update({ is_active: false, updated_at: trx.fn.now() });
+          .update({ is_active: false });
       }
 
       const [inserted] = await trx<BankAccountRow>('user_bank_account')
@@ -304,7 +304,7 @@ export class BankAccountService {
       }
       await trx('user_bank_account')
         .where('id', id)
-        .update({ is_active: false, updated_at: trx.fn.now() });
+        .update({ is_active: false });
     });
   }
 
@@ -393,7 +393,6 @@ export class BankAccountService {
             reviewed_by: reviewer,
             reviewed_at: trx.fn.now(),
             rejection_reason: null,
-            updated_at: trx.fn.now(),
           })
           .returning('*');
         return updated;
@@ -430,7 +429,6 @@ export class BankAccountService {
           rejection_reason: reason,
           reviewed_by: reviewer,
           reviewed_at: trx.fn.now(),
-          updated_at: trx.fn.now(),
         })
         .returning('*');
       return updated;

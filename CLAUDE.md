@@ -423,6 +423,7 @@ try {
 3. Run migration: `bun run migrate`
 4. Create corresponding seed file if needed
 - Production applies pending migrations on startup (`src/utils/run-migrations.ts`, before Nest boots); elsewhere only with `RUN_MIGRATIONS_ON_STARTUP=true` (`false` turns it off in production). Keep each migration compatible with the previous release: it keeps serving while the new one migrates, and a rollback starts an older build against the newer schema.
+- `updated_at`: the `set_updated_at()` trigger keeps it current (only when the row actually changes) on `transaction`, `user`, `subscription`, `buy_order`, `package` and `user_bank_account`, so don't set it by hand there. Attach it to new tables with `updated_at` (`CREATE TRIGGER <table>_set_updated_at BEFORE UPDATE ON <table> FOR EACH ROW EXECUTE FUNCTION set_updated_at()`). **Not** `sell_order`: its `updated_at` is set by hand on status changes and payout attempts only, and the sell crons time stuck orders from it. Not the Better Auth `admin_*` tables (the library sets its own)
 - Long or non-transactional (`transaction: false`) migrations: run them by hand with the CLI. Killed mid-run, they leave knex's lock set and the app won't start until `npx knex migrate:unlock`.
 
 ### PayHere Webhook Testing
