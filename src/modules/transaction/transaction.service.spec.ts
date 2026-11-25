@@ -254,3 +254,74 @@ describe('isPurchaseSettlement', () => {
     ).toBe(true);
   });
 });
+
+describe('TransactionService wallet balance (dca-summary)', () => {
+  const build = (balance: Record<string, unknown>) => {
+    const bitcoinDeepa = {
+      isConfigured: () => true,
+      getUserBalance: jest.fn().mockResolvedValue(balance),
+    };
+    const price = {
+      getBtcLkrRate: jest.fn().mockResolvedValue(null),
+      getBitcoin24HrChange: jest.fn().mockResolvedValue(null),
+    };
+    const service = new TransactionService(
+      {} as never,
+      price as never,
+      {} as never,
+      {} as never,
+      bitcoinDeepa as never,
+      {} as never,
+    );
+    return (
+      service as unknown as {
+        fetchBalanceAndMarket: (id: string) => Promise<Record<string, unknown>>;
+      }
+    ).fetchBalanceAndMarket('42');
+  };
+
+  it('shows pot sats apart from what the member can spend', async () => {
+    const pots = [
+      { name: 'rent', balance: 3_000 },
+      { name: 'trip', balance: 1_500 },
+    ];
+    await expect(
+      build({
+        success: true,
+        balance: 10_000,
+        balance_lkr: '3,000.00',
+        available_balance: 5_500,
+        pot_balance: 4_500,
+        pots,
+      }),
+    ).resolves.toMatchObject({
+      total_balance: 10_000,
+      spendable_balance: 5_500,
+      pot_balance: 4_500,
+      pots,
+      balance_available: true,
+    });
+  });
+
+  it('treats a bot without pot fields as all spendable', async () => {
+    await expect(
+      build({ success: true, balance: 7_000, balance_lkr: '1.00' }),
+    ).resolves.toMatchObject({
+      total_balance: 7_000,
+      spendable_balance: 7_000,
+      pot_balance: 0,
+      pots: [],
+    });
+  });
+
+  it('is all zeros when the balance can’t be read', async () => {
+    await expect(
+      build({ success: false, message: 'down' }),
+    ).resolves.toMatchObject({
+      balance_available: false,
+      spendable_balance: 0,
+      pot_balance: 0,
+      pots: [],
+    });
+  });
+});

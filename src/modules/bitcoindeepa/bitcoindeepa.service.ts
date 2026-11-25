@@ -95,17 +95,51 @@ export interface UserBalanceRequest {
   telegram_id: number;
 }
 
+export interface UserBalancePot {
+  name: string;
+  /** sats */
+  balance: number;
+}
+
+/**
+ * The bot's `/api/v1/userbalance` answer. Savings pots aren't separate
+ * wallets: their sats stay in the user's wallet and are only earmarked by the
+ * bot, so `balance` includes them and can't all be moved.
+ */
 export interface UserBalanceResponse {
   success: boolean;
   message?: string;
   telegram_id?: number;
-  balance?: number; // balance in satoshis
+  /** The whole wallet in sats, pots included */
+  balance?: number;
   balance_lkr?: string;
+  /** Spendable sats: `balance` minus pots, never below 0 */
+  available_balance?: number;
+  available_balance_lkr?: string;
+  /** Sats locked in savings pots (withdrawn in the bot before they can move) */
+  pot_balance?: number;
+  pot_balance_lkr?: string;
+  /** Each pot, oldest first */
+  pots?: UserBalancePot[];
   first_name?: string;
   last_name?: string;
   username?: string;
   created_at?: string;
 }
+
+/**
+ * The sats a user can actually move. A bot from before pot balances were
+ * returned has no `available_balance`: then the whole `balance` (the old
+ * behaviour). Undefined when the answer has no balance at all.
+ */
+export const spendableSats = (b: UserBalanceResponse): number | undefined => {
+  if (typeof b.available_balance === 'number') return b.available_balance;
+  return typeof b.balance === 'number' ? b.balance : undefined;
+};
+
+/** Sats in savings pots; 0 when the bot didn't say (older bot, or no pots). */
+export const potSats = (b: UserBalanceResponse): number =>
+  typeof b.pot_balance === 'number' ? b.pot_balance : 0;
 
 export interface UserTransactionsRequest {
   telegram_id: number;
