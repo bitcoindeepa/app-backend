@@ -7,6 +7,7 @@ import { RedisService } from '../redis/redis.service';
 import { CacheKeys } from '../redis/utils/cache-keys.util';
 import * as dayjs from 'dayjs';
 import { errorMessage } from '../../common/error-message';
+import { TelegramLoggerService } from '../telegram-logger/telegram-logger.service';
 
 @Injectable()
 export class SubscriptionService {
@@ -16,6 +17,7 @@ export class SubscriptionService {
     private readonly knexService: KnexService,
     private readonly payHereService: PayHereService,
     private readonly redisService: RedisService,
+    private readonly telegramLogger: TelegramLoggerService,
   ) {}
 
   /**
@@ -126,74 +128,71 @@ export class SubscriptionService {
     return subscriptionDetails;
   }
 
+  /**
+   * Cancel at PayHere, then mark the plan inactive here. No DB transaction is
+   * held across PayHere's call (up to 10s plus its OAuth call): it would pin
+   * a pool connection for that long, and it can't make the remote cancel
+   * atomic anyway. PayHere is where billing stops, so it goes first; if our
+   * update then fails, the team is alerted to mark the plan inactive.
+   */
   async cancelPayHereSubscription(payhere_sub_id: string): Promise<void> {
-    const trx = await this.knexService.knex.transaction();
+    const knex = this.knexService.knex;
+    const subscription = await knex('subscription')
+      .where('payhere_sub_id', payhere_sub_id)
+      .first<{ user_id: string } | undefined>();
+    if (!subscription) {
+      throw new BadRequestException('Subscription not found');
+    }
 
+    let result: Awaited<ReturnType<PayHereService['cancelSubscription']>>;
     try {
-      this.logger.log(
-        `Starting atomic cancellation for subscription: ${payhere_sub_id}`,
-      );
-
-      // First, get the subscription to verify it exists and get user_id
-      const subscription = await trx('subscription')
-        .where('payhere_sub_id', payhere_sub_id)
-        .first();
-
-      if (!subscription) {
-        throw new BadRequestException('Subscription not found');
-      }
-
-      // Call PayHere API to cancel subscription
-      this.logger.log(
-        `Attempting PayHere API cancellation for subscription: ${payhere_sub_id}`,
-      );
-      const result =
-        await this.payHereService.cancelSubscription(payhere_sub_id);
-
-      // Check if PayHere cancellation was successful
-      if (!result || result.status !== 1) {
-        throw new BadRequestException(
-          `PayHere cancellation failed, status: ${result?.status || 'unknown'}`,
-        );
-      }
-
-      // If PayHere API call succeeded, update database
-      await trx('subscription')
-        .update({
-          is_active: false,
-          updated_at: this.knexService.knex.fn.now(),
-        })
-        .where('payhere_sub_id', payhere_sub_id);
-
-      // Commit transaction
-      await trx.commit();
-
-      // Invalidate cache after successful commit (non-critical operation)
-      try {
-        await this.invalidateUserSubscriptionCache(subscription.user_id);
-      } catch (cacheError) {
-        // Log cache error but don't fail the operation since DB operation succeeded
-        this.logger.warn(
-          `Failed to invalidate cache after successful cancellation of ${payhere_sub_id}: ${errorMessage(cacheError)}`,
-        );
-      }
-
-      this.logger.log(
-        `Subscription ${payhere_sub_id} successfully cancelled atomically`,
-      );
+      result = await this.payHereService.cancelSubscription(payhere_sub_id);
     } catch (error) {
-      // Rollback transaction on any error
-      await trx.rollback();
       this.logger.error(
-        `Atomic cancellation failed for subscription ${payhere_sub_id}: ${errorMessage(error)}`,
+        `PayHere cancellation of ${payhere_sub_id} failed: ${errorMessage(error)}`,
       );
-
-      if (error instanceof BadRequestException) {
-        throw error;
-      }
-
       throw new BadRequestException('Subscription cancellation failed');
     }
+    if (!result || result.status !== 1) {
+      throw new BadRequestException(
+        `PayHere cancellation failed, status: ${result?.status || 'unknown'}`,
+      );
+    }
+
+    try {
+      await knex('subscription')
+        .update({ is_active: false, updated_at: knex.fn.now() })
+        .where('payhere_sub_id', payhere_sub_id);
+    } catch (error) {
+      // PayHere stopped billing, but the app still shows the plan as active
+      this.logger.error(
+        `Subscription ${payhere_sub_id} was cancelled at PayHere but marking it inactive failed: ${errorMessage(error)}`,
+      );
+      await this.telegramLogger.logAlert(
+        'Subscription',
+        'Cancelled at PayHere, but marking it inactive here failed. Set subscription.is_active = false.',
+        {
+          level: 'stopped',
+          title: 'cancelled at PayHere only',
+          fields: [
+            ['Subscription', payhere_sub_id, 'code'],
+            ['User', `#UID${subscription.user_id}`],
+            ['Error', errorMessage(error)],
+          ],
+        },
+      );
+      throw new BadRequestException('Subscription cancellation failed');
+    }
+
+    // Non-critical: the cancellation is recorded
+    try {
+      await this.invalidateUserSubscriptionCache(subscription.user_id);
+    } catch (cacheError) {
+      this.logger.warn(
+        `Failed to invalidate cache after cancelling ${payhere_sub_id}: ${errorMessage(cacheError)}`,
+      );
+    }
+    this.logger.log(`Subscription ${payhere_sub_id} cancelled`);
   }
 
   /**

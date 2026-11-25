@@ -12,7 +12,12 @@ import type { Knex } from 'knex';
 import { KnexService } from '../knex/knex.service';
 import { RedisService } from '../redis/redis.service';
 import { CacheKeys } from '../redis/utils/cache-keys.util';
-import { CeyPayBank, CeyPayService } from '../ceypay/ceypay.service';
+import {
+  CeyPayBank,
+  type CeyPayBankAccount,
+  CeyPayService,
+  ceyPayTimeoutMs,
+} from '../ceypay/ceypay.service';
 import { R2StorageService } from '../storage/r2-storage.service';
 import { TelegramLoggerService } from '../telegram-logger/telegram-logger.service';
 import { type User, UserService } from '../user/user.service';
@@ -38,6 +43,49 @@ import type {
 
 const BANK_LIST_CACHE_TTL_SECONDS = 60 * 60;
 
+const beingApproved = () =>
+  new ConflictException(
+    'This bank account is being approved. Try again in a minute.',
+  );
+/**
+ * How long an approve holds its claim on an account (`approving_at`): its
+ * CeyPay calls (at most 3) take up to 3 × `CEYPAY_TIMEOUT`, plus a 30s margin
+ * for the bounded DB steps around them, and never less than 120s. A claim
+ * older than this is taken to be from an approve that crashed, and another
+ * approve may take it.
+ *
+ * Not a hard guarantee: an approve stalled past the claim by something
+ * outside these bounds (an exhausted DB pool, a statement timeout) can be
+ * taken over while still running. Our record stays right (step 3 only writes
+ * under its own claim), but CeyPay doesn't dedupe, so both may add the
+ * account there: a duplicate CeyPay bank account, not a wrong payout.
+ */
+export const approvalClaimSeconds = (): number =>
+  Math.max(120, Math.ceil((3 * ceyPayTimeoutMs()) / 1000) + 30);
+
+/** Accounts not held by a live approve (no claim, or one that has expired). */
+const withoutLiveClaim =
+  (claimSeconds: number) =>
+  (q: Knex.QueryBuilder): void =>
+    void q
+      .whereNull('approving_at')
+      .orWhereRaw('approving_at <= now() - make_interval(secs => ?)', [
+        claimSeconds,
+      ]);
+
+/** Same bank and number, compared as CeyPay could return them. */
+const sameAccount = (
+  b: CeyPayBankAccount,
+  account: Pick<BankAccountRow, 'bank_code' | 'account_number'>,
+): boolean =>
+  String(b.bankCode) === String(account.bank_code) &&
+  String(b.accountNumber).replace(/\D/g, '') ===
+    account.account_number.replace(/\D/g, '');
+
+const sameName = (a: string, b: string): boolean =>
+  a.trim().replace(/\s+/g, ' ').toLowerCase() ===
+  b.trim().replace(/\s+/g, ' ').toLowerCase();
+
 export interface BankAccountRow {
   id: string;
   user_id: string;
@@ -52,6 +100,8 @@ export interface BankAccountRow {
   reviewed_by: string | null;
   reviewed_at: Date | null;
   ceypay_user_bank_id: string | null;
+  /** Set while an approve is talking to CeyPay (its claim); null otherwise */
+  approving_at: Date | null;
   is_active: boolean;
   created_at: Date;
   updated_at: Date;
@@ -302,9 +352,15 @@ export class BankAccountService {
           'This account has a sale in progress. Try again once it finishes.',
         );
       }
-      await trx('user_bank_account')
+      const removed = await trx('user_bank_account')
         .where('id', id)
-        .update({ is_active: false, updated_at: trx.fn.now() });
+        .where(withoutLiveClaim(approvalClaimSeconds()))
+        .update({
+          is_active: false,
+          approving_at: null,
+          updated_at: trx.fn.now(),
+        });
+      if (removed === 0) throw beingApproved();
     });
   }
 
@@ -347,65 +403,119 @@ export class BankAccountService {
 
   /**
    * Verify an account: register it with CeyPay (aggregator user + bank
-   * account), then mark it VERIFIED. The row stays locked during the CeyPay
-   * calls so two admins can't register it twice. If CeyPay fails the account
-   * stays PENDING_REVIEW.
+   * account), then mark it VERIFIED. If CeyPay fails the account stays
+   * PENDING_REVIEW.
+   *
+   * Claim / call / record, so no transaction or row lock is held while
+   * CeyPay answers (up to 10s per call): a lock on the member's `user` row
+   * would block every insert that references them (a login's session, a
+   * payment, a sell quote) for that long.
+   * 1. Claim: a short transaction sets `approving_at`, so a second approve
+   *    gets 409 instead of registering the account twice. A claim older than
+   *    approvalClaimSeconds() (a crashed approve) can be taken over. Reject
+   *    and the member's remove also get 409 while a live claim holds.
+   * 2. CeyPay, with nothing held. CeyPay doesn't dedupe bank accounts, so an
+   *    account it already has for the member with the same bank, number and
+   *    name (an earlier approve whose answer or commit was lost) is reused
+   *    instead of added again. Same number under another name (a rejected
+   *    name, resubmitted corrected) is added anew: payouts must go out under
+   *    the name a reviewer approved.
+   * 3. Record: a short transaction re-checks KYC and sets VERIFIED only if
+   *    this approve's claim still holds.
    */
   async approve(id: string, reviewer: string): Promise<BankAccountRow> {
-    const row = await this.knex.transaction(async (trx) => {
-      const account = await this.lockPending(trx, id);
-      const user = await trx('user')
-        .where('id', account.user_id)
-        .forUpdate()
-        .first<{
-          id: string;
-          ceypay_user_id: string | null;
-          kyc_status: KycStatus;
-        }>();
-      if (user.kyc_status !== KycStatus.APPROVED) {
-        throw new ConflictException(
-          `The member's KYC is no longer approved (${user.kyc_status})`,
-        );
-      }
+    const { account, user, claimedAt } = await this.claimApproval(id);
 
-      try {
-        let ceypayUserId = user.ceypay_user_id;
-        if (!ceypayUserId) {
-          ceypayUserId = (await this.ceyPayService.upsertUser(user.id)).userId;
+    let ceypayBank: CeyPayBankAccount;
+    try {
+      let ceypayUserId = user.ceypay_user_id;
+      if (!ceypayUserId) {
+        // Idempotent on our user id, so a retry gets the same CeyPay user
+        ceypayUserId = (await this.ceyPayService.upsertUser(user.id)).userId;
+        // Bounded, so a wait on the member's row can't outlast the claim (the
+        // only DB write between the claim and the CeyPay calls)
+        await this.knex.transaction(async (trx) => {
+          await trx.raw("SET LOCAL lock_timeout = '5s'");
           await trx('user')
             .where('id', user.id)
+            .whereNull('ceypay_user_id')
             .update({ ceypay_user_id: ceypayUserId });
-        }
-        const ceypayBank = await this.ceyPayService.addBankAccount(
-          ceypayUserId,
-          {
-            bankCode: account.bank_code,
-            accountNumber: account.account_number,
-            accountName: account.account_name,
-          },
-        );
-
-        const [updated] = await trx<BankAccountRow>('user_bank_account')
-          .where('id', id)
-          .update({
-            status: BankAccountStatus.VERIFIED,
-            ceypay_user_bank_id: ceypayBank.userBankId,
-            reviewed_by: reviewer,
-            reviewed_at: trx.fn.now(),
-            rejection_reason: null,
-            updated_at: trx.fn.now(),
-          })
-          .returning('*');
-        return updated;
-      } catch (error) {
-        this.logger.error(
-          `Registering bank account ${id} with CeyPay failed: ${errorMessage(error)}`,
-        );
-        throw new BadGatewayException(
-          `Could not register the account with CeyPay: ${errorMessage(error)}`,
+        });
+      }
+      const known = (
+        await this.ceyPayService.listBankAccounts(ceypayUserId)
+      ).filter((b) => sameAccount(b, account));
+      const existing = known.find((b) =>
+        sameName(b.accountName, account.account_name),
+      );
+      if (!existing && known.length > 0) {
+        this.logger.warn(
+          `Bank account ${id}: CeyPay already has ${known.map((b) => b.userBankId).join(', ')} for this number under another name; adding it under the approved name`,
         );
       }
+      ceypayBank =
+        existing ??
+        (await this.ceyPayService.addBankAccount(ceypayUserId, {
+          bankCode: account.bank_code,
+          accountNumber: account.account_number,
+          accountName: account.account_name,
+        }));
+    } catch (error) {
+      await this.releaseApprovalClaim(id, claimedAt);
+      this.logger.error(
+        `Registering bank account ${id} with CeyPay failed: ${errorMessage(error)}`,
+      );
+      throw new BadGatewayException(
+        `Could not register the account with CeyPay: ${errorMessage(error)}`,
+      );
+    }
+
+    const outcome = await this.knex.transaction(async (trx) => {
+      // FOR SHARE: holds off a KYC change until we commit, without blocking
+      // inserts that reference the member (they only need FOR KEY SHARE)
+      const current = await trx('user')
+        .where('id', account.user_id)
+        .forShare()
+        .first<{ kyc_status: KycStatus }>();
+      if (current.kyc_status !== KycStatus.APPROVED) {
+        return { kycStatus: current.kyc_status } as const;
+      }
+      const [updated] = await trx<BankAccountRow>('user_bank_account')
+        .where({
+          id,
+          is_active: true,
+          status: BankAccountStatus.PENDING_REVIEW,
+          approving_at: claimedAt,
+        })
+        .update({
+          status: BankAccountStatus.VERIFIED,
+          ceypay_user_bank_id: ceypayBank.userBankId,
+          reviewed_by: reviewer,
+          reviewed_at: trx.fn.now(),
+          rejection_reason: null,
+          approving_at: null,
+          updated_at: trx.fn.now(),
+        })
+        .returning('*');
+      return { row: updated } as const;
     });
+    if ('kycStatus' in outcome) {
+      // Registered at CeyPay but not verified here; a later approve reuses it
+      await this.releaseApprovalClaim(id, claimedAt);
+      throw new ConflictException(
+        `The member's KYC is no longer approved (${outcome.kycStatus})`,
+      );
+    }
+    const row = outcome.row;
+    if (!row) {
+      // Removed, rejected or taken over by another approve meanwhile
+      this.logger.warn(
+        `Bank account ${id} changed while it was being approved; registered at CeyPay as ${ceypayBank.userBankId} but not verified`,
+      );
+      throw new ConflictException(
+        'The bank account changed while it was being approved',
+      );
+    }
 
     await this.telegramLogger.notifyUser(
       row.user_id,
@@ -425,14 +535,19 @@ export class BankAccountService {
       await this.lockPending(trx, id);
       const [updated] = await trx<BankAccountRow>('user_bank_account')
         .where('id', id)
+        // Not while an approve is registering it at CeyPay: the approve
+        // decides (approve then reject the verified account if needed)
+        .where(withoutLiveClaim(approvalClaimSeconds()))
         .update({
           status: BankAccountStatus.REJECTED,
           rejection_reason: reason,
           reviewed_by: reviewer,
           reviewed_at: trx.fn.now(),
+          approving_at: null,
           updated_at: trx.fn.now(),
         })
         .returning('*');
+      if (!updated) throw beingApproved();
       return updated;
     });
 
@@ -461,5 +576,54 @@ export class BankAccountService {
       );
     }
     return account;
+  }
+
+  /**
+   * Step 1 of `approve`: in a short transaction, check the account and the
+   * member's KYC and claim the approval. Nothing remote happens inside, and
+   * the member's `user` row is only read, not locked.
+   */
+  private async claimApproval(id: string) {
+    return this.knex.transaction(async (trx) => {
+      const account = await this.lockPending(trx, id);
+      const user = await trx('user').where('id', account.user_id).first<{
+        id: string;
+        ceypay_user_id: string | null;
+        kyc_status: KycStatus;
+      }>();
+      if (user.kyc_status !== KycStatus.APPROVED) {
+        throw new ConflictException(
+          `The member's KYC is no longer approved (${user.kyc_status})`,
+        );
+      }
+      const [claimed] = await trx<BankAccountRow>('user_bank_account')
+        .where('id', id)
+        .where(withoutLiveClaim(approvalClaimSeconds()))
+        // clock_timestamp(), not now() (the transaction's start): a wait for
+        // the row lock above mustn't use up the claim. Milliseconds, so the
+        // JS Date read back matches it exactly in step 3
+        .update({
+          approving_at: trx.raw(
+            "date_trunc('milliseconds', clock_timestamp())",
+          ),
+        })
+        .returning('*');
+      if (!claimed) throw beingApproved();
+      return { account: claimed, user, claimedAt: claimed.approving_at! };
+    });
+  }
+
+  /** Give the claim back so the account can be approved again at once. */
+  private async releaseApprovalClaim(id: string, claimedAt: Date) {
+    try {
+      await this.knex('user_bank_account')
+        .where({ id, approving_at: claimedAt })
+        .update({ approving_at: null });
+    } catch (error) {
+      // It expires after approvalClaimSeconds() anyway
+      this.logger.warn(
+        `Releasing the approval claim on bank account ${id} failed: ${errorMessage(error)}`,
+      );
+    }
   }
 }

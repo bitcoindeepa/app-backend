@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto';
 import * as request from 'supertest';
 import {
   createTestApp,
@@ -341,13 +342,289 @@ describe('Bank account verification (e2e)', () => {
       expect(ctx.ceyPay.addBankAccount).toHaveBeenCalledTimes(1);
     });
 
-    it('keeps the account pending when CeyPay fails', async () => {
+    it('keeps the account pending when CeyPay fails, and it can be approved again at once', async () => {
       const id = await submitBankAccount(ctx, USER);
       ctx.ceyPay.addBankAccount.mockRejectedValueOnce(new Error('CeyPay down'));
       await asAdmin(ctx, cookies)
         .post(`/admin/bank-reviews/${id}/approve`)
         .expect(502);
-      expect((await account(id)).status).toBe('PENDING_REVIEW');
+      const row = await account(id);
+      expect(row.status).toBe('PENDING_REVIEW');
+      expect(row.approving_at).toBeNull(); // the claim was given back
+
+      await asAdmin(ctx, cookies)
+        .post(`/admin/bank-reviews/${id}/approve`)
+        .expect(200, { id, status: 'VERIFIED' });
+    });
+
+    // #97: nothing is held while CeyPay answers (up to 10s per call)
+    describe('while CeyPay is being called', () => {
+      const registered = (a: {
+        bankCode: number;
+        accountNumber: string;
+        accountName: string;
+      }) => ({ userBankId: randomUUID(), ...a, bankName: 'Bank' });
+
+      it("doesn't lock the member's user row", async () => {
+        const id = await submitBankAccount(ctx, USER);
+        ctx.ceyPay.addBankAccount.mockImplementationOnce(
+          async (_userId: string, a: Parameters<typeof registered>[0]) => {
+            // A login updating the member's row; it used to wait for the
+            // approve's FOR UPDATE and time out here
+            await ctx.knex.transaction(async (trx) => {
+              await trx.raw("SET LOCAL lock_timeout = '1s'");
+              await trx('user')
+                .where({ id: USER })
+                .update({ tg_username: 'during_approve' });
+            });
+            return registered(a);
+          },
+        );
+        await asAdmin(ctx, cookies)
+          .post(`/admin/bank-reviews/${id}/approve`)
+          .expect(200, { id, status: 'VERIFIED' });
+        expect(
+          (await ctx.knex('user').where({ id: USER }).first()).tg_username,
+        ).toBe('during_approve');
+      });
+
+      it('answers a second approve with 409 instead of registering twice', async () => {
+        const id = await submitBankAccount(ctx, USER);
+        let second = 0;
+        ctx.ceyPay.addBankAccount.mockImplementationOnce(
+          async (_userId: string, a: Parameters<typeof registered>[0]) => {
+            second = (
+              await asAdmin(ctx, cookies).post(
+                `/admin/bank-reviews/${id}/approve`,
+              )
+            ).status;
+            return registered(a);
+          },
+        );
+        await asAdmin(ctx, cookies)
+          .post(`/admin/bank-reviews/${id}/approve`)
+          .expect(200, { id, status: 'VERIFIED' });
+        expect(second).toBe(409);
+        expect(ctx.ceyPay.addBankAccount).toHaveBeenCalledTimes(1);
+      });
+
+      it("doesn't verify if the member's KYC is revoked meanwhile", async () => {
+        const id = await submitBankAccount(ctx, USER);
+        ctx.ceyPay.addBankAccount.mockImplementationOnce(
+          async (_userId: string, a: Parameters<typeof registered>[0]) => {
+            await ctx
+              .knex('user')
+              .where({ id: USER })
+              .update({ kyc_status: 'DECLINED' });
+            return registered(a);
+          },
+        );
+        await asAdmin(ctx, cookies)
+          .post(`/admin/bank-reviews/${id}/approve`)
+          .expect(409);
+        const row = await account(id);
+        expect(row.status).toBe('PENDING_REVIEW');
+        expect(row.approving_at).toBeNull();
+      });
+
+      // The approve decides: rejecting or removing the account while it is
+      // being registered at CeyPay would leave a CeyPay record for an
+      // account the member was told is not approved
+      it('answers a reject with 409, and the approve completes', async () => {
+        const id = await submitBankAccount(ctx, USER);
+        let reject = 0;
+        ctx.ceyPay.addBankAccount.mockImplementationOnce(
+          async (_userId: string, a: Parameters<typeof registered>[0]) => {
+            reject = (
+              await asAdmin(ctx, cookies).post(
+                `/admin/bank-reviews/${id}/reject`,
+                { reason: 'Name does not match' },
+              )
+            ).status;
+            return registered(a);
+          },
+        );
+        await asAdmin(ctx, cookies)
+          .post(`/admin/bank-reviews/${id}/approve`)
+          .expect(200, { id, status: 'VERIFIED' });
+        expect(reject).toBe(409);
+        expect(ctx.notifyUser).not.toHaveBeenCalledWith(
+          USER,
+          expect.stringContaining('not approved'),
+        );
+      });
+
+      it("answers the member's remove with 409, and the approve completes", async () => {
+        const id = await submitBankAccount(ctx, USER);
+        let remove = 0;
+        ctx.ceyPay.addBankAccount.mockImplementationOnce(
+          async (_userId: string, a: Parameters<typeof registered>[0]) => {
+            remove = (await asUser(ctx, USER).delete(`/bank-accounts/${id}`))
+              .status;
+            return registered(a);
+          },
+        );
+        await asAdmin(ctx, cookies)
+          .post(`/admin/bank-reviews/${id}/approve`)
+          .expect(200, { id, status: 'VERIFIED' });
+        expect(remove).toBe(409);
+        expect((await account(id)).is_active).toBe(true);
+      });
+    });
+
+    // An approve that outlived its claim must not verify over the approve
+    // that took the claim over, even before that one finishes (so this
+    // checks the claim, not just status = VERIFIED)
+    it("doesn't let an approve whose claim was taken over verify the account", async () => {
+      type NewAccount = {
+        bankCode: number;
+        accountNumber: string;
+        accountName: string;
+      };
+      // supertest closes a server it started itself once a request ends, and
+      // that close waits for B, which is still open: listen here instead
+      const server = ctx.app.getHttpServer();
+      let releaseB!: () => void;
+      const bGate = new Promise<void>((r) => (releaseB = r));
+      await new Promise<void>((r) => server.listen(0, r));
+      try {
+        const id = await submitBankAccount(ctx, USER);
+        let enteredB!: () => void;
+        const bInCeyPay = new Promise<void>((r) => (enteredB = r));
+        let approveB!: Promise<request.Response>;
+
+        ctx.ceyPay.addBankAccount
+          .mockImplementationOnce(async (_userId: string, a: NewAccount) => {
+            // A is slow: its claim expires and B takes it over
+            await ctx
+              .knex('user_bank_account')
+              .where({ id })
+              .update({
+                approving_at: ctx.knex.raw("now() - interval '1 hour'"),
+              });
+            approveB = asAdmin(ctx, cookies)
+              .post(`/admin/bank-reviews/${id}/approve`)
+              .then((res) => res);
+            await Promise.race([bInCeyPay, approveB]);
+            return { userBankId: randomUUID(), ...a, bankName: 'Bank' };
+          })
+          .mockImplementationOnce(async (_userId: string, a: NewAccount) => {
+            enteredB();
+            await bGate;
+            return { userBankId: randomUUID(), ...a, bankName: 'Bank' };
+          });
+
+        await asAdmin(ctx, cookies)
+          .post(`/admin/bank-reviews/${id}/approve`)
+          .expect(409);
+        const meanwhile = await account(id);
+        expect(meanwhile.status).toBe('PENDING_REVIEW');
+        expect(meanwhile.approving_at).not.toBeNull(); // B's claim, untouched
+
+        releaseB();
+        const b = await approveB;
+        expect(b.status).toBe(200);
+        expect(b.body).toEqual({ id, status: 'VERIFIED' });
+      } finally {
+        releaseB(); // so a failed assertion doesn't leave B open
+        await new Promise((r) => server.close(r));
+      }
+    });
+
+    it("rejecting an account with a crashed approve's claim works and clears it", async () => {
+      const id = await submitBankAccount(ctx, USER);
+      await ctx
+        .knex('user_bank_account')
+        .where({ id })
+        .update({ approving_at: ctx.knex.raw("now() - interval '1 hour'") });
+      await asAdmin(ctx, cookies)
+        .post(`/admin/bank-reviews/${id}/reject`, {
+          reason: 'Blurry statement',
+        })
+        .expect(200, { id, status: 'REJECTED' });
+      expect((await account(id)).approving_at).toBeNull();
+    });
+
+    it('reuses the account CeyPay already has instead of adding it again', async () => {
+      const id = await submitBankAccount(ctx, USER);
+      const existing = randomUUID();
+      // An earlier approve registered it, but its answer or commit was lost
+      ctx.ceyPay.listBankAccounts.mockResolvedValueOnce([
+        {
+          userBankId: existing,
+          bankCode: 7010,
+          bankName: 'Bank',
+          accountNumber: '1234567890',
+          accountName: 'T. User',
+        },
+      ]);
+      await asAdmin(ctx, cookies)
+        .post(`/admin/bank-reviews/${id}/approve`)
+        .expect(200, { id, status: 'VERIFIED' });
+      expect(ctx.ceyPay.addBankAccount).not.toHaveBeenCalled();
+      expect((await account(id)).ceypay_user_bank_id).toBe(existing);
+    });
+
+    it('matches what CeyPay lists loosely: bank code as a string, spacing and case', async () => {
+      const id = await submitBankAccount(ctx, USER);
+      const existing = randomUUID();
+      ctx.ceyPay.listBankAccounts.mockResolvedValueOnce([
+        {
+          userBankId: existing,
+          bankCode: '7010' as unknown as number,
+          bankName: 'Bank',
+          accountNumber: '1234 5678 90',
+          accountName: '  t.  user ',
+        },
+      ]);
+      await asAdmin(ctx, cookies)
+        .post(`/admin/bank-reviews/${id}/approve`)
+        .expect(200, { id, status: 'VERIFIED' });
+      expect(ctx.ceyPay.addBankAccount).not.toHaveBeenCalled();
+      expect((await account(id)).ceypay_user_bank_id).toBe(existing);
+    });
+
+    it("doesn't reuse a CeyPay record for the same number under another name", async () => {
+      // e.g. rejected for the name, then resubmitted with it corrected:
+      // payouts must go out under the name the reviewer approved
+      const id = await submitBankAccount(ctx, USER);
+      ctx.ceyPay.listBankAccounts.mockResolvedValueOnce([
+        {
+          userBankId: randomUUID(),
+          bankCode: 7010,
+          bankName: 'Bank',
+          accountNumber: '1234567890',
+          accountName: 'Someone Else',
+        },
+      ]);
+      await asAdmin(ctx, cookies)
+        .post(`/admin/bank-reviews/${id}/approve`)
+        .expect(200, { id, status: 'VERIFIED' });
+      expect(ctx.ceyPay.addBankAccount).toHaveBeenCalledTimes(1);
+      expect(ctx.ceyPay.addBankAccount).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ accountName: 'T. User' }),
+      );
+    });
+
+    it("a crashed approve's claim expires, a fresh one is respected", async () => {
+      const id = await submitBankAccount(ctx, USER);
+      await ctx
+        .knex('user_bank_account')
+        .where({ id })
+        .update({ approving_at: ctx.knex.raw("now() - interval '1 minute'") });
+      await asAdmin(ctx, cookies)
+        .post(`/admin/bank-reviews/${id}/approve`)
+        .expect(409);
+
+      await ctx
+        .knex('user_bank_account')
+        .where({ id })
+        .update({ approving_at: ctx.knex.raw("now() - interval '1 hour'") });
+      await asAdmin(ctx, cookies)
+        .post(`/admin/bank-reviews/${id}/approve`)
+        .expect(200, { id, status: 'VERIFIED' });
+      expect((await account(id)).approving_at).toBeNull();
     });
 
     it('rejecting needs a reason and lets the user resubmit', async () => {

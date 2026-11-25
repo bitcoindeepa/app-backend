@@ -12,6 +12,10 @@ export interface CeyPayUser {
   externalUserId: string;
 }
 
+/** Per-request timeout for CeyPay calls (`CEYPAY_TIMEOUT`, ms; default 10s). */
+export const ceyPayTimeoutMs = (): number =>
+  parseInt(process.env.CEYPAY_TIMEOUT || '10000', 10) || 10_000;
+
 export interface CeyPayBankAccount {
   userBankId: string;
   bankCode: number;
@@ -90,10 +94,7 @@ export class CeyPayService {
   private readonly secret = process.env.CEYPAY_API_SECRET || '';
   private readonly webhookPublicKey =
     process.env.CEYPAY_WEBHOOK_PUBLIC_KEY || '';
-  private readonly timeout = parseInt(
-    process.env.CEYPAY_TIMEOUT || '10000',
-    10,
-  );
+  private readonly timeout = ceyPayTimeoutMs();
 
   isConfigured(): boolean {
     return !!(this.apiUrl && this.keyId && this.secret);
