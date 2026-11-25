@@ -639,4 +639,95 @@ describe('Passkeys (e2e)', () => {
       expect(mini.body.code).toBe('passkey_unavailable');
     });
   });
+
+  describe('signing in with a passkey (web)', () => {
+    const signIn = async (key: SoftPasskey, origin = ORIGIN) => {
+      const start = await http().post('/auth/passkey/options').expect(200);
+      expect(start.body.options.rpId).toBe(RP_ID);
+      expect(start.body.options.allowCredentials ?? []).toEqual([]);
+      const response = key.get(start.body.options, origin);
+      return {
+        attempt: start.body.attempt_id as string,
+        response,
+        res: await http()
+          .post('/auth/passkey/login')
+          .send({ attempt_id: start.body.attempt_id, response }),
+      };
+    };
+    const sessionCookie = (res: request.Response) =>
+      ([] as string[])
+        .concat(res.headers['set-cookie'] ?? [])
+        .find((c) => c.startsWith('sid='))
+        ?.split(';')[0];
+
+    it("starts an unlocked web session for the passkey's owner", async () => {
+      const { key } = await register(await webSession(OTHER_USER));
+      const { res } = await signIn(key);
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ user: { telegram_id: OTHER_USER } });
+      const cookie = sessionCookie(res);
+      expect(cookie).toBeDefined();
+
+      const me = await http()
+        .get('/auth/me')
+        .set('Cookie', cookie!)
+        .expect(200);
+      expect(me.body).toMatchObject({
+        user: { telegram_id: OTHER_USER },
+        session: { kind: 'web' },
+      });
+      const status = await http()
+        .get('/passkey')
+        .set('Cookie', cookie!)
+        .expect(200);
+      expect(status.body).toMatchObject({ enabled: true, unlocked: true });
+      // Unlocked: the lock-gated routes work (writes need the app's Origin)
+      await http()
+        .delete(`/bank-accounts/${randomUUID()}`)
+        .set('Cookie', cookie!)
+        .set('Origin', ORIGIN)
+        .expect(404);
+    });
+
+    it('uses each attempt once', async () => {
+      const { key } = await register(await webSession());
+      const { attempt, response, res } = await signIn(key);
+      expect(res.status).toBe(200);
+      const again = await http()
+        .post('/auth/passkey/login')
+        .send({ attempt_id: attempt, response })
+        .expect(400);
+      expect(again.body.code).toBe('challenge_expired');
+    });
+
+    it("refuses a passkey we don't know, another origin, or a bad request", async () => {
+      await register(await webSession());
+      const stranger = softPasskey(RP_ID);
+      const unknown = await signIn(stranger);
+      expect(unknown.res.status).toBe(400);
+      expect(unknown.res.body.code).toBe('passkey_not_verified');
+      expect(sessionCookie(unknown.res)).toBeUndefined();
+
+      const { key } = await register(await webSession(OTHER_USER));
+      const phished = await signIn(key, 'https://evil.test');
+      expect(phished.res.status).toBe(400);
+      expect(sessionCookie(phished.res)).toBeUndefined();
+
+      await http()
+        .post('/auth/passkey/login')
+        .send({ attempt_id: 'nope', response: {} })
+        .expect(400);
+      const expired = await http()
+        .post('/auth/passkey/login')
+        .send({ attempt_id: randomUUID(), response: { id: key.credentialId } })
+        .expect(400);
+      expect(expired.body.code).toBe('challenge_expired');
+    });
+
+    it('is unavailable without APP_URL', async () => {
+      delete process.env.APP_URL;
+      const res = await http().post('/auth/passkey/options').expect(503);
+      expect(res.body.code).toBe('passkey_unavailable');
+    });
+  });
 });
