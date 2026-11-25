@@ -486,6 +486,19 @@ describe('Passkeys (e2e)', () => {
       expect(ctx.p2pBot.request).toHaveBeenCalledTimes(1);
     });
 
+    it('matches the send however its numbers are written', async () => {
+      const web = await webSession();
+      const { key } = await register(web);
+      const approval = await approve(web, key, sendAction());
+      await http()
+        .post('/p2p/send')
+        .set(web)
+        .set(approval)
+        .send({ ...sendBody, amount: '1e3', to_telegram_id: `${OTHER_USER}.0` })
+        .expect(200);
+      expect(ctx.p2pBot.request).toHaveBeenCalledTimes(1);
+    });
+
     it('refuses an approval for another amount, recipient or payment key', async () => {
       const web = await webSession();
       const { key } = await register(web);

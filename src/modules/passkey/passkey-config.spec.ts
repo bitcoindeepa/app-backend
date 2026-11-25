@@ -67,6 +67,12 @@ describe('approvalKey', () => {
         amount: '01000',
       }),
     ).toBe('p2p_send:100000002:1000:k1');
+    // Every form P2pSendDto's Number() conversion accepts maps to the same key
+    for (const amount of ['1e3', '1000.0', '+1000', ' 1000 ', '0x3e8']) {
+      expect(approvalKey('p2p_send', { ...body, amount })).toBe(
+        'p2p_send:100000002:1000:k1',
+      );
+    }
     expect(approvalKey('p2p_send', { ...body, amount: 1001 })).not.toBe(
       approvalKey('p2p_send', body),
     );
