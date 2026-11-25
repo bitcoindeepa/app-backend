@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto';
 import * as request from 'supertest';
 import {
   createTestApp,
@@ -341,13 +342,130 @@ describe('Bank account verification (e2e)', () => {
       expect(ctx.ceyPay.addBankAccount).toHaveBeenCalledTimes(1);
     });
 
-    it('keeps the account pending when CeyPay fails', async () => {
+    it('keeps the account pending when CeyPay fails, and it can be approved again at once', async () => {
       const id = await submitBankAccount(ctx, USER);
       ctx.ceyPay.addBankAccount.mockRejectedValueOnce(new Error('CeyPay down'));
       await asAdmin(ctx, cookies)
         .post(`/admin/bank-reviews/${id}/approve`)
         .expect(502);
-      expect((await account(id)).status).toBe('PENDING_REVIEW');
+      const row = await account(id);
+      expect(row.status).toBe('PENDING_REVIEW');
+      expect(row.approving_at).toBeNull(); // the claim was given back
+
+      await asAdmin(ctx, cookies)
+        .post(`/admin/bank-reviews/${id}/approve`)
+        .expect(200, { id, status: 'VERIFIED' });
+    });
+
+    // #97: nothing is held while CeyPay answers (up to 10s per call)
+    describe('while CeyPay is being called', () => {
+      const registered = (a: {
+        bankCode: number;
+        accountNumber: string;
+        accountName: string;
+      }) => ({ userBankId: randomUUID(), ...a, bankName: 'Bank' });
+
+      it("doesn't lock the member's user row", async () => {
+        const id = await submitBankAccount(ctx, USER);
+        ctx.ceyPay.addBankAccount.mockImplementationOnce(
+          async (_userId: string, a: Parameters<typeof registered>[0]) => {
+            // A login updating the member's row; it used to wait for the
+            // approve's FOR UPDATE and time out here
+            await ctx.knex.transaction(async (trx) => {
+              await trx.raw("SET LOCAL lock_timeout = '1s'");
+              await trx('user')
+                .where({ id: USER })
+                .update({ tg_username: 'during_approve' });
+            });
+            return registered(a);
+          },
+        );
+        await asAdmin(ctx, cookies)
+          .post(`/admin/bank-reviews/${id}/approve`)
+          .expect(200, { id, status: 'VERIFIED' });
+        expect(
+          (await ctx.knex('user').where({ id: USER }).first()).tg_username,
+        ).toBe('during_approve');
+      });
+
+      it('answers a second approve with 409 instead of registering twice', async () => {
+        const id = await submitBankAccount(ctx, USER);
+        let second = 0;
+        ctx.ceyPay.addBankAccount.mockImplementationOnce(
+          async (_userId: string, a: Parameters<typeof registered>[0]) => {
+            second = (
+              await asAdmin(ctx, cookies).post(
+                `/admin/bank-reviews/${id}/approve`,
+              )
+            ).status;
+            return registered(a);
+          },
+        );
+        await asAdmin(ctx, cookies)
+          .post(`/admin/bank-reviews/${id}/approve`)
+          .expect(200, { id, status: 'VERIFIED' });
+        expect(second).toBe(409);
+        expect(ctx.ceyPay.addBankAccount).toHaveBeenCalledTimes(1);
+      });
+
+      it("doesn't verify if the member's KYC is revoked meanwhile", async () => {
+        const id = await submitBankAccount(ctx, USER);
+        ctx.ceyPay.addBankAccount.mockImplementationOnce(
+          async (_userId: string, a: Parameters<typeof registered>[0]) => {
+            await ctx
+              .knex('user')
+              .where({ id: USER })
+              .update({ kyc_status: 'DECLINED' });
+            return registered(a);
+          },
+        );
+        await asAdmin(ctx, cookies)
+          .post(`/admin/bank-reviews/${id}/approve`)
+          .expect(409);
+        const row = await account(id);
+        expect(row.status).toBe('PENDING_REVIEW');
+        expect(row.approving_at).toBeNull();
+      });
+    });
+
+    it('reuses the account CeyPay already has instead of adding it again', async () => {
+      const id = await submitBankAccount(ctx, USER);
+      const existing = randomUUID();
+      // An earlier approve registered it, but its answer or commit was lost
+      ctx.ceyPay.listBankAccounts.mockResolvedValueOnce([
+        {
+          userBankId: existing,
+          bankCode: 7010,
+          bankName: 'Bank',
+          accountNumber: '1234567890',
+          accountName: 'T. User',
+        },
+      ]);
+      await asAdmin(ctx, cookies)
+        .post(`/admin/bank-reviews/${id}/approve`)
+        .expect(200, { id, status: 'VERIFIED' });
+      expect(ctx.ceyPay.addBankAccount).not.toHaveBeenCalled();
+      expect((await account(id)).ceypay_user_bank_id).toBe(existing);
+    });
+
+    it("a crashed approve's claim expires, a fresh one is respected", async () => {
+      const id = await submitBankAccount(ctx, USER);
+      await ctx
+        .knex('user_bank_account')
+        .where({ id })
+        .update({ approving_at: ctx.knex.raw("now() - interval '1 minute'") });
+      await asAdmin(ctx, cookies)
+        .post(`/admin/bank-reviews/${id}/approve`)
+        .expect(409);
+
+      await ctx
+        .knex('user_bank_account')
+        .where({ id })
+        .update({ approving_at: ctx.knex.raw("now() - interval '1 hour'") });
+      await asAdmin(ctx, cookies)
+        .post(`/admin/bank-reviews/${id}/approve`)
+        .expect(200, { id, status: 'VERIFIED' });
+      expect((await account(id)).approving_at).toBeNull();
     });
 
     it('rejecting needs a reason and lets the user resubmit', async () => {

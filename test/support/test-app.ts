@@ -68,6 +68,7 @@ export interface TestContext {
     getBanks: jest.Mock;
     upsertUser: jest.Mock;
     addBankAccount: jest.Mock;
+    listBankAccounts: jest.Mock;
     getQuote: jest.Mock;
     createOfframp: jest.Mock;
     getOfframp: jest.Mock;
@@ -129,6 +130,8 @@ export async function createTestApp(): Promise<TestContext> {
     getBanks: jest.fn().mockResolvedValue(BANKS),
     upsertUser: jest.fn(),
     addBankAccount: jest.fn(),
+    // CeyPay has no bank accounts for the member yet, unless a test says so
+    listBankAccounts: jest.fn().mockResolvedValue([]),
     getQuote: jest.fn(quoteAt(CEYPAY_USDT_LKR)),
     createOfframp: jest.fn(),
     getOfframp: jest.fn(),
@@ -352,6 +355,7 @@ export function resetSellMocks(ctx: TestContext): void {
       a: { bankCode: number; accountNumber: string; accountName: string },
     ) => Promise.resolve({ userBankId: randomUUID(), ...a, bankName: 'Bank' }),
   );
+  ceyPay.listBankAccounts.mockResolvedValue([]);
   ceyPay.getQuote.mockImplementation(quoteAt(CEYPAY_USDT_LKR));
   ceyPay.createOfframp.mockImplementation((body: { externalRef: string }) =>
     Promise.resolve({

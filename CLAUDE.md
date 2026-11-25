@@ -41,7 +41,8 @@ This is a NestJS-based backend service for the BitcoinDeepa DCA (Dollar Cost Ave
 4. **Subscription Module** (`src/modules/subscription/`)
    - User subscription lifecycle management
    - PayHere payment link generation
-   - Subscription cancellation via PayHere API
+   - Subscription cancellation via PayHere API: PayHere first, then `is_active = false` here, with no DB transaction held across the call; if our update fails after PayHere cancelled, a `stopped` alert asks a human to mark it inactive
+- Never hold a DB transaction or row lock across an external HTTP call (PayHere, CeyPay, Didit, the bot): claim the row in a short transaction, call with nothing held, record the result with a conditional update (#97)
 
 5. **Transaction Module** (`src/modules/transaction/`)
    - PayHere webhook processing and signature validation
@@ -88,7 +89,7 @@ This is a NestJS-based backend service for the BitcoinDeepa DCA (Dollar Cost Ave
 11. **Bank Account Module** (`src/modules/bank-account/`) - users' payout bank accounts and their admin verification
    - User uploads a statement to R2 via a temporary presigned PUT (`POST /bank-accounts/statement-upload`), then submits the account (`POST /bank-accounts`). The backend `HEAD`s the object (exists, under the user's prefix, PDF/JPEG/PNG, <= 8 MB)
    - Every account starts `PENDING_REVIEW` (one in review/verified per user). `name_match_score` (ported CeyFi `name-match.util.ts`, account name vs **`user.kyc_full_name`**, the name Didit read from the ID) is only a reviewer hint. Never compare against `first_name`/`last_name`: those are the Telegram profile name, which the member controls. If `kyc_full_name` is missing it is fetched from Didit; without it submission is refused (503)
-   - Admin approve re-checks KYC is still `APPROVED` (409 otherwise), registers it with CeyPay (aggregator user + bank account) inside the row lock, then sets `VERIFIED`; CeyPay failure leaves it pending (502). Reject needs a reason; the same account can be resubmitted. The user gets a Telegram DM either way
+   - Admin approve re-checks KYC is still `APPROVED` (409 otherwise), registers it with CeyPay (aggregator user + bank account), then sets `VERIFIED`; CeyPay failure leaves it pending (502). Claim / call / record, never a lock across CeyPay: a short transaction claims the account (`approving_at`, 409 to a second approve; a claim older than `APPROVAL_CLAIM_SECONDS` = 120 is from a crashed approve and can be taken over), CeyPay is called with nothing held (an account CeyPay already lists for the member is reused, since `addBankAccount` doesn't dedupe), then a short transaction re-checks KYC and sets `VERIFIED` only if the claim still holds. The member's `user` row is never locked for the call (a lock there blocks every insert referencing them) Reject needs a reason; the same account can be resubmitted. The user gets a Telegram DM either way
    - `BankVerifiedGuard` (exported) gates anything that pays out to the account. Removing an account is blocked while a sell order on it is in flight
 
 12. **Sell Module** (`src/modules/sell/`) - users sell sats for LKR paid to their verified bank account by CeyPay
