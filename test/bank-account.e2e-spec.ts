@@ -472,6 +472,65 @@ describe('Bank account verification (e2e)', () => {
       });
     });
 
+    // An approve that outlived its claim must not verify over the approve
+    // that took the claim over, even before that one finishes (so this
+    // checks the claim, not just status = VERIFIED)
+    it("doesn't let an approve whose claim was taken over verify the account", async () => {
+      type NewAccount = {
+        bankCode: number;
+        accountNumber: string;
+        accountName: string;
+      };
+      // supertest closes a server it started itself once a request ends, and
+      // that close waits for B, which is still open: listen here instead
+      const server = ctx.app.getHttpServer();
+      let releaseB!: () => void;
+      const bGate = new Promise<void>((r) => (releaseB = r));
+      await new Promise<void>((r) => server.listen(0, r));
+      try {
+        const id = await submitBankAccount(ctx, USER);
+        let enteredB!: () => void;
+        const bInCeyPay = new Promise<void>((r) => (enteredB = r));
+        let approveB!: Promise<request.Response>;
+
+        ctx.ceyPay.addBankAccount
+          .mockImplementationOnce(async (_userId: string, a: NewAccount) => {
+            // A is slow: its claim expires and B takes it over
+            await ctx
+              .knex('user_bank_account')
+              .where({ id })
+              .update({
+                approving_at: ctx.knex.raw("now() - interval '1 hour'"),
+              });
+            approveB = asAdmin(ctx, cookies)
+              .post(`/admin/bank-reviews/${id}/approve`)
+              .then((res) => res);
+            await Promise.race([bInCeyPay, approveB]);
+            return { userBankId: randomUUID(), ...a, bankName: 'Bank' };
+          })
+          .mockImplementationOnce(async (_userId: string, a: NewAccount) => {
+            enteredB();
+            await bGate;
+            return { userBankId: randomUUID(), ...a, bankName: 'Bank' };
+          });
+
+        await asAdmin(ctx, cookies)
+          .post(`/admin/bank-reviews/${id}/approve`)
+          .expect(409);
+        const meanwhile = await account(id);
+        expect(meanwhile.status).toBe('PENDING_REVIEW');
+        expect(meanwhile.approving_at).not.toBeNull(); // B's claim, untouched
+
+        releaseB();
+        const b = await approveB;
+        expect(b.status).toBe(200);
+        expect(b.body).toEqual({ id, status: 'VERIFIED' });
+      } finally {
+        releaseB(); // so a failed assertion doesn't leave B open
+        await new Promise((r) => server.close(r));
+      }
+    });
+
     it("rejecting an account with a crashed approve's claim works and clears it", async () => {
       const id = await submitBankAccount(ctx, USER);
       await ctx
