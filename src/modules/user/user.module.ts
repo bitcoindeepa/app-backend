@@ -5,12 +5,14 @@ import { AuthModule } from '../auth/auth.module';
 import { KnexModule } from '../knex/knex.module';
 import { TelegramLoggerModule } from '../telegram-logger/telegram-logger.module';
 import { DiditModule } from '../didit/didit.module';
+import { LarkModule } from '../lark/lark.module';
 
 @Module({
   imports: [
     forwardRef(() => AuthModule),
     KnexModule,
     TelegramLoggerModule,
+    LarkModule,
     forwardRef(() => DiditModule),
   ],
   providers: [UserService],

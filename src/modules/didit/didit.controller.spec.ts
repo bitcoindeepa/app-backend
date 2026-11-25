@@ -15,7 +15,25 @@ const now = () => String(Math.floor(Date.now() / 1000));
 function setup(secret = SECRET, currentStatus: string = KycStatus.IN_PROGRESS) {
   // Real UserService (it owns the status logic), database calls stubbed
   const telegramLogger = { logAlert: jest.fn().mockResolvedValue(undefined) };
-  const realUserService = new UserService({} as never, telegramLogger as never);
+  const lark = { sendKycInReview: jest.fn().mockResolvedValue(true) };
+  const userConfig = {
+    get: (key: string) =>
+      key === 'DIDIT_CONSOLE_PATH'
+        ? 'https://business.didit.me/console/org1/app1/users'
+        : undefined,
+  };
+  const realUserService = new UserService(
+    {} as never,
+    telegramLogger as never,
+    lark as never,
+    userConfig as never,
+  );
+  jest.spyOn(realUserService, 'getUserById').mockResolvedValue({
+    id: 'u1',
+    username: 'amal',
+    tg_username: 'amal_tg',
+    email: 'amal@example.com',
+  } as never);
   const userService = {
     getUserByKycSessionId: jest
       .spyOn(realUserService, 'getUserByKycSessionId')
@@ -47,7 +65,7 @@ function setup(secret = SECRET, currentStatus: string = KycStatus.IN_PROGRESS) {
     redis,
     didit as unknown as DiditService,
   );
-  return { controller, userService, didit, telegramLogger };
+  return { controller, userService, didit, telegramLogger, lark };
 }
 
 function call(
@@ -240,6 +258,51 @@ describe('DiditController webhook', () => {
       const { controller, telegramLogger } = setup();
       await call(controller, { session_id: 's1', status: 'Abandoned' });
       expect(telegramLogger.logAlert).not.toHaveBeenCalled();
+    });
+
+    it('In Review posts the Lark card with a Didit console link', async () => {
+      const { controller, lark, telegramLogger } = setup();
+      await call(controller, {
+        session_id: 's1',
+        status: 'In Review',
+        decision: { id_verifications: [{ full_name: 'Amal Perera' }] },
+      });
+      expect(lark.sendKycInReview).toHaveBeenCalledWith({
+        subject: 'Bitcoin Deepa member',
+        fields: [
+          { label: 'Name (from ID)', value: 'Amal Perera' },
+          { label: 'User ID', value: 'u1' },
+          { label: 'Username', value: '@amal' },
+          { label: 'Telegram', value: '@amal_tg' },
+          { label: 'Email', value: 'amal@example.com' },
+          { label: 'Didit session', value: null },
+        ],
+        diditUrl:
+          'https://business.didit.me/console/org1/app1/kyc/verifications/s1',
+      });
+      expect(telegramLogger.logAlert).not.toHaveBeenCalled();
+    });
+
+    it('does not post In Review again when the user is already in review', async () => {
+      const { controller, lark } = setup(SECRET, KycStatus.IN_REVIEW);
+      await call(controller, { session_id: 's1', status: 'In Review' });
+      expect(lark.sendKycInReview).not.toHaveBeenCalled();
+    });
+
+    it('a failing Lark post does not fail the webhook', async () => {
+      const { controller, userService, lark } = setup();
+      lark.sendKycInReview.mockRejectedValue(new Error('lark down'));
+      await expect(
+        call(controller, { session_id: 's1', status: 'In Review' }),
+      ).resolves.toEqual({ success: true });
+      expect(userService.updateKycStatus).toHaveBeenCalled();
+    });
+
+    it('does not post to Lark for other results', async () => {
+      const { controller, lark } = setup();
+      await call(controller, { session_id: 's1', status: 'Approved' });
+      await call(controller, { session_id: 's1', status: 'Declined' });
+      expect(lark.sendKycInReview).not.toHaveBeenCalled();
     });
 
     it('Resubmitted maps to IN_PROGRESS', async () => {
