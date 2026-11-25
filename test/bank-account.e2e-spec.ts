@@ -426,6 +426,64 @@ describe('Bank account verification (e2e)', () => {
         expect(row.status).toBe('PENDING_REVIEW');
         expect(row.approving_at).toBeNull();
       });
+
+      // The approve decides: rejecting or removing the account while it is
+      // being registered at CeyPay would leave a CeyPay record for an
+      // account the member was told is not approved
+      it('answers a reject with 409, and the approve completes', async () => {
+        const id = await submitBankAccount(ctx, USER);
+        let reject = 0;
+        ctx.ceyPay.addBankAccount.mockImplementationOnce(
+          async (_userId: string, a: Parameters<typeof registered>[0]) => {
+            reject = (
+              await asAdmin(ctx, cookies).post(
+                `/admin/bank-reviews/${id}/reject`,
+                { reason: 'Name does not match' },
+              )
+            ).status;
+            return registered(a);
+          },
+        );
+        await asAdmin(ctx, cookies)
+          .post(`/admin/bank-reviews/${id}/approve`)
+          .expect(200, { id, status: 'VERIFIED' });
+        expect(reject).toBe(409);
+        expect(ctx.notifyUser).not.toHaveBeenCalledWith(
+          USER,
+          expect.stringContaining('not approved'),
+        );
+      });
+
+      it("answers the member's remove with 409, and the approve completes", async () => {
+        const id = await submitBankAccount(ctx, USER);
+        let remove = 0;
+        ctx.ceyPay.addBankAccount.mockImplementationOnce(
+          async (_userId: string, a: Parameters<typeof registered>[0]) => {
+            remove = (await asUser(ctx, USER).delete(`/bank-accounts/${id}`))
+              .status;
+            return registered(a);
+          },
+        );
+        await asAdmin(ctx, cookies)
+          .post(`/admin/bank-reviews/${id}/approve`)
+          .expect(200, { id, status: 'VERIFIED' });
+        expect(remove).toBe(409);
+        expect((await account(id)).is_active).toBe(true);
+      });
+    });
+
+    it("rejecting an account with a crashed approve's claim works and clears it", async () => {
+      const id = await submitBankAccount(ctx, USER);
+      await ctx
+        .knex('user_bank_account')
+        .where({ id })
+        .update({ approving_at: ctx.knex.raw("now() - interval '1 hour'") });
+      await asAdmin(ctx, cookies)
+        .post(`/admin/bank-reviews/${id}/reject`, {
+          reason: 'Blurry statement',
+        })
+        .expect(200, { id, status: 'REJECTED' });
+      expect((await account(id)).approving_at).toBeNull();
     });
 
     it('reuses the account CeyPay already has instead of adding it again', async () => {
@@ -446,6 +504,48 @@ describe('Bank account verification (e2e)', () => {
         .expect(200, { id, status: 'VERIFIED' });
       expect(ctx.ceyPay.addBankAccount).not.toHaveBeenCalled();
       expect((await account(id)).ceypay_user_bank_id).toBe(existing);
+    });
+
+    it('matches what CeyPay lists loosely: bank code as a string, spacing and case', async () => {
+      const id = await submitBankAccount(ctx, USER);
+      const existing = randomUUID();
+      ctx.ceyPay.listBankAccounts.mockResolvedValueOnce([
+        {
+          userBankId: existing,
+          bankCode: '7010' as unknown as number,
+          bankName: 'Bank',
+          accountNumber: '1234 5678 90',
+          accountName: '  t.  user ',
+        },
+      ]);
+      await asAdmin(ctx, cookies)
+        .post(`/admin/bank-reviews/${id}/approve`)
+        .expect(200, { id, status: 'VERIFIED' });
+      expect(ctx.ceyPay.addBankAccount).not.toHaveBeenCalled();
+      expect((await account(id)).ceypay_user_bank_id).toBe(existing);
+    });
+
+    it("doesn't reuse a CeyPay record for the same number under another name", async () => {
+      // e.g. rejected for the name, then resubmitted with it corrected:
+      // payouts must go out under the name the reviewer approved
+      const id = await submitBankAccount(ctx, USER);
+      ctx.ceyPay.listBankAccounts.mockResolvedValueOnce([
+        {
+          userBankId: randomUUID(),
+          bankCode: 7010,
+          bankName: 'Bank',
+          accountNumber: '1234567890',
+          accountName: 'Someone Else',
+        },
+      ]);
+      await asAdmin(ctx, cookies)
+        .post(`/admin/bank-reviews/${id}/approve`)
+        .expect(200, { id, status: 'VERIFIED' });
+      expect(ctx.ceyPay.addBankAccount).toHaveBeenCalledTimes(1);
+      expect(ctx.ceyPay.addBankAccount).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ accountName: 'T. User' }),
+      );
     });
 
     it("a crashed approve's claim expires, a fresh one is respected", async () => {

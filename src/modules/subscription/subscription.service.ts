@@ -170,8 +170,16 @@ export class SubscriptionService {
       );
       await this.telegramLogger.logAlert(
         'Subscription',
-        `Subscription ${payhere_sub_id} (#UID${subscription.user_id}) was cancelled at PayHere, but marking it inactive here failed: ${errorMessage(error)}. Set subscription.is_active = false for it.`,
-        { level: 'stopped', title: 'cancelled at PayHere only' },
+        'Cancelled at PayHere, but marking it inactive here failed. Set subscription.is_active = false.',
+        {
+          level: 'stopped',
+          title: 'cancelled at PayHere only',
+          fields: [
+            ['Subscription', payhere_sub_id, 'code'],
+            ['User', `#UID${subscription.user_id}`],
+            ['Error', errorMessage(error)],
+          ],
+        },
       );
       throw new BadRequestException('Subscription cancellation failed');
     }

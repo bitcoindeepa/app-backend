@@ -16,6 +16,7 @@ import {
   CeyPayBank,
   type CeyPayBankAccount,
   CeyPayService,
+  ceyPayTimeoutMs,
 } from '../ceypay/ceypay.service';
 import { R2StorageService } from '../storage/r2-storage.service';
 import { TelegramLoggerService } from '../telegram-logger/telegram-logger.service';
@@ -41,12 +42,43 @@ import type {
 } from './dto/bank-account.dto';
 
 const BANK_LIST_CACHE_TTL_SECONDS = 60 * 60;
+
+const beingApproved = () =>
+  new ConflictException(
+    'This bank account is being approved. Try again in a minute.',
+  );
 /**
  * How long an approve holds its claim on an account (`approving_at`). Its
- * CeyPay calls take at most ~30s (3 calls, 10s timeout each); a claim older
- * than this is from an approve that crashed, and another approve may take it.
+ * CeyPay calls (at most 3) take up to 3 × `CEYPAY_TIMEOUT`, plus a margin, and
+ * never less than 120s; a claim older than this is from an approve that
+ * crashed, and another approve may take it. Derived from the timeout, so a
+ * slow but live approve is never taken over mid-call.
  */
-export const APPROVAL_CLAIM_SECONDS = 120;
+export const approvalClaimSeconds = (): number =>
+  Math.max(120, Math.ceil((3 * ceyPayTimeoutMs()) / 1000) + 30);
+
+/** Accounts not held by a live approve (no claim, or one that has expired). */
+const withoutLiveClaim =
+  (claimSeconds: number) =>
+  (q: Knex.QueryBuilder): void =>
+    void q
+      .whereNull('approving_at')
+      .orWhereRaw('approving_at <= now() - make_interval(secs => ?)', [
+        claimSeconds,
+      ]);
+
+/** Same bank and number, compared as CeyPay could return them. */
+const sameAccount = (
+  b: CeyPayBankAccount,
+  account: Pick<BankAccountRow, 'bank_code' | 'account_number'>,
+): boolean =>
+  String(b.bankCode) === String(account.bank_code) &&
+  String(b.accountNumber).replace(/\D/g, '') ===
+    account.account_number.replace(/\D/g, '');
+
+const sameName = (a: string, b: string): boolean =>
+  a.trim().replace(/\s+/g, ' ').toLowerCase() ===
+  b.trim().replace(/\s+/g, ' ').toLowerCase();
 
 export interface BankAccountRow {
   id: string;
@@ -314,9 +346,15 @@ export class BankAccountService {
           'This account has a sale in progress. Try again once it finishes.',
         );
       }
-      await trx('user_bank_account')
+      const removed = await trx('user_bank_account')
         .where('id', id)
-        .update({ is_active: false, updated_at: trx.fn.now() });
+        .where(withoutLiveClaim(approvalClaimSeconds()))
+        .update({
+          is_active: false,
+          approving_at: null,
+          updated_at: trx.fn.now(),
+        });
+      if (removed === 0) throw beingApproved();
     });
   }
 
@@ -368,10 +406,14 @@ export class BankAccountService {
    * payment, a sell quote) for that long.
    * 1. Claim: a short transaction sets `approving_at`, so a second approve
    *    gets 409 instead of registering the account twice. A claim older than
-   *    APPROVAL_CLAIM_SECONDS (a crashed approve) can be taken over.
+   *    approvalClaimSeconds() (a crashed approve) can be taken over. Reject
+   *    and the member's remove also get 409 while a live claim holds.
    * 2. CeyPay, with nothing held. CeyPay doesn't dedupe bank accounts, so an
-   *    account it already has for the member (an earlier approve whose
-   *    answer or commit was lost) is reused instead of added again.
+   *    account it already has for the member with the same bank, number and
+   *    name (an earlier approve whose answer or commit was lost) is reused
+   *    instead of added again. Same number under another name (a rejected
+   *    name, resubmitted corrected) is added anew: payouts must go out under
+   *    the name a reviewer approved.
    * 3. Record: a short transaction re-checks KYC and sets VERIFIED only if
    *    this approve's claim still holds.
    */
@@ -389,13 +431,17 @@ export class BankAccountService {
           .whereNull('ceypay_user_id')
           .update({ ceypay_user_id: ceypayUserId });
       }
-      const existing = (
+      const known = (
         await this.ceyPayService.listBankAccounts(ceypayUserId)
-      ).find(
-        (b) =>
-          b.bankCode === account.bank_code &&
-          b.accountNumber === account.account_number,
+      ).filter((b) => sameAccount(b, account));
+      const existing = known.find((b) =>
+        sameName(b.accountName, account.account_name),
       );
+      if (!existing && known.length > 0) {
+        this.logger.warn(
+          `Bank account ${id}: CeyPay already has ${known.map((b) => b.userBankId).join(', ')} for this number under another name; adding it under the approved name`,
+        );
+      }
       ceypayBank =
         existing ??
         (await this.ceyPayService.addBankAccount(ceypayUserId, {
@@ -478,14 +524,19 @@ export class BankAccountService {
       await this.lockPending(trx, id);
       const [updated] = await trx<BankAccountRow>('user_bank_account')
         .where('id', id)
+        // Not while an approve is registering it at CeyPay: the approve
+        // decides (approve then reject the verified account if needed)
+        .where(withoutLiveClaim(approvalClaimSeconds()))
         .update({
           status: BankAccountStatus.REJECTED,
           rejection_reason: reason,
           reviewed_by: reviewer,
           reviewed_at: trx.fn.now(),
+          approving_at: null,
           updated_at: trx.fn.now(),
         })
         .returning('*');
+      if (!updated) throw beingApproved();
       return updated;
     });
 
@@ -536,22 +587,11 @@ export class BankAccountService {
       }
       const [claimed] = await trx<BankAccountRow>('user_bank_account')
         .where('id', id)
-        .where(
-          (q) =>
-            void q
-              .whereNull('approving_at')
-              .orWhereRaw('approving_at <= now() - make_interval(secs => ?)', [
-                APPROVAL_CLAIM_SECONDS,
-              ]),
-        )
+        .where(withoutLiveClaim(approvalClaimSeconds()))
         // Milliseconds, so the JS Date read back matches it exactly in step 3
         .update({ approving_at: trx.raw("date_trunc('milliseconds', now())") })
         .returning('*');
-      if (!claimed) {
-        throw new ConflictException(
-          'This bank account is already being approved',
-        );
-      }
+      if (!claimed) throw beingApproved();
       return { account: claimed, user, claimedAt: claimed.approving_at! };
     });
   }
@@ -563,7 +603,7 @@ export class BankAccountService {
         .where({ id, approving_at: claimedAt })
         .update({ approving_at: null });
     } catch (error) {
-      // It expires after APPROVAL_CLAIM_SECONDS anyway
+      // It expires after approvalClaimSeconds() anyway
       this.logger.warn(
         `Releasing the approval claim on bank account ${id} failed: ${errorMessage(error)}`,
       );
