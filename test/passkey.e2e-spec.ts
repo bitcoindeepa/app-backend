@@ -344,6 +344,74 @@ describe('Passkeys (e2e)', () => {
       expect(send.body.code).toBe('passkey_setup_required');
     });
 
+    it('rechecks the limit and the lock when the passkey is stored', async () => {
+      const web = await webSession();
+      const { status } = await register(web);
+
+      // Options were fine at 9; by the time the response arrives there are 10
+      await ctx.knex('user_passkey').insert(
+        Array.from({ length: 8 }, (_, i) => ({
+          user_id: USER,
+          credential_id: `filler-${i}`,
+          public_key: Buffer.from('x'),
+          name: `Filler ${i}`,
+        })),
+      );
+      let key = softPasskey(RP_ID);
+      let options = await http()
+        .post('/passkey/register/options')
+        .set(web)
+        .expect(200);
+      await ctx.knex('user_passkey').insert({
+        user_id: USER,
+        credential_id: 'filler-last',
+        public_key: Buffer.from('x'),
+        name: 'Filler last',
+      });
+      const full = await http()
+        .post('/passkey/register')
+        .set(web)
+        .send({ response: key.create(options.body, ORIGIN) })
+        .expect(400);
+      expect(full.body.code).toBe('passkey_limit');
+      await ctx.knex('user_passkey').where('name', 'like', 'Filler%').del();
+
+      // The session locked after asking for options: storing is refused
+      key = softPasskey(RP_ID);
+      options = await http()
+        .post('/passkey/register/options')
+        .set(web)
+        .expect(200);
+      await ctx
+        .knex('user_session')
+        .where({ user_id: USER, kind: 'web' })
+        .update({ unlocked_at: null });
+      const locked = await http()
+        .post('/passkey/register')
+        .set(web)
+        .send({ response: key.create(options.body, ORIGIN) })
+        .expect(403);
+      expect(locked.body.code).toBe('passkey_required');
+      const list = await http().get('/passkey').set(miniApp()).expect(200);
+      expect(list.body.passkeys.map((p: { id: string }) => p.id)).toEqual([
+        status.passkeys[0].id,
+      ]);
+    });
+
+    it('answers 400, not 500, for a response without a usable credential id', async () => {
+      const web = await webSession();
+      await register(web);
+      const browser = await webSession();
+      for (const id of [undefined, '', 42, { toString: null }, ['x']]) {
+        const res = await http()
+          .post('/passkey/unlock')
+          .set(browser)
+          .send({ response: { id, response: {} } })
+          .expect(400);
+        expect(res.body.code).toBe('passkey_not_verified');
+      }
+    });
+
     it('uses WEBAUTHN_RP_ID when set', async () => {
       process.env.WEBAUTHN_RP_ID = 'bitcoindeepa.test';
       const web = await webSession();

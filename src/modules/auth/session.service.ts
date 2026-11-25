@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { createHash, randomBytes } from 'crypto';
+import type { Knex } from 'knex';
 import { KnexService } from '../knex/knex.service';
 import type { JwtPayload } from './auth.service';
 
@@ -177,9 +178,9 @@ export class SessionService {
     };
   }
 
-  /** This session just unlocked with a passkey */
-  async markUnlocked(sessionId: string): Promise<void> {
-    await this.knex('user_session')
+  /** This session just unlocked with a passkey (in `trx` when given) */
+  async markUnlocked(sessionId: string, trx?: Knex.Transaction): Promise<void> {
+    await (trx ?? this.knex)('user_session')
       .where({ id: sessionId })
       .update({ unlocked_at: new Date() });
   }
@@ -191,8 +192,9 @@ export class SessionService {
   async lockOtherSessions(
     userId: string,
     exceptSessionId: string,
+    trx?: Knex.Transaction,
   ): Promise<void> {
-    await this.knex('user_session')
+    await (trx ?? this.knex)('user_session')
       .where({ user_id: userId })
       .whereNot({ id: exceptSessionId })
       .whereNotNull('unlocked_at')

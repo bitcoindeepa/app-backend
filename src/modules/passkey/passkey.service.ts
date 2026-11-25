@@ -20,7 +20,7 @@ import {
   type VerifiedRegistrationResponse,
 } from '@simplewebauthn/server';
 import { KnexService } from '../knex/knex.service';
-import { SessionService } from '../auth/session.service';
+import { isSessionLocked, SessionService } from '../auth/session.service';
 import type { RequestWithUser } from '../auth/conditional-auth.guard';
 import { errorMessage } from '../../common/error-message';
 import { relyingParty, type RelyingParty } from './passkey-config';
@@ -93,7 +93,9 @@ export class PasskeyService {
     const rows = await this.list(user.id);
     return {
       enabled: rows.length > 0,
-      unlocked: user.locked !== true,
+      // No passkey = never locked, even if the session was read before the
+      // last one was removed
+      unlocked: rows.length === 0 || user.locked !== true,
       available: user.sessionKind === 'web' && relyingParty() !== null,
       passkeys: rows.map(toView),
     };
@@ -108,12 +110,7 @@ export class PasskeyService {
     // Adding one more needs the session unlocked, or a stolen session could
     // add its own passkey and unlock with it
     if (rows.length > 0) this.assertUnlocked(user);
-    if (rows.length >= MAX_PASSKEYS) {
-      throw new BadRequestException({
-        code: 'passkey_limit',
-        message: `You can have up to ${MAX_PASSKEYS} passkeys. Remove one first.`,
-      });
-    }
+    if (rows.length >= MAX_PASSKEYS) throw this.limitReached();
 
     const options = await generateRegistrationOptions({
       rpName: rp.name,
@@ -175,31 +172,54 @@ export class PasskeyService {
 
     const { credential, credentialDeviceType, credentialBackedUp } =
       verified.registrationInfo;
-    const inserted = await this.knex('user_passkey')
-      .insert({
-        user_id: user.id,
-        credential_id: credential.id,
-        public_key: Buffer.from(credential.publicKey),
-        counter: credential.counter,
-        transports: credential.transports ?? null,
-        device_type: credentialDeviceType,
-        backed_up: credentialBackedUp,
-        name: name?.trim() || 'Passkey',
-      })
-      .onConflict('credential_id')
-      .ignore()
-      .returning('id');
-    if (inserted.length === 0) {
-      throw new BadRequestException({
-        code: 'passkey_exists',
-        message: 'This passkey is already registered.',
-      });
-    }
 
-    if (existing.length === 0) {
-      await this.sessions.lockOtherSessions(user.id, user.sessionId!);
-    }
-    await this.sessions.markUnlocked(user.sessionId!);
+    // One transaction per member, holding their user row: the limit and the
+    // lock are checked against what's committed now (not the read above),
+    // and the new passkey, locking the other sessions and unlocking this one
+    // land together or not at all
+    await this.knex.transaction(async (trx) => {
+      await trx('user').where('id', user.id).forNoKeyUpdate().first('id');
+      const [{ n }] = await trx('user_passkey')
+        .where({ user_id: user.id })
+        .count<{ n: string }[]>('* as n');
+      const count = Number(n);
+      if (count >= MAX_PASSKEYS) throw this.limitReached();
+      if (count > 0) {
+        const session = await trx('user_session')
+          .where({ id: user.sessionId })
+          .first<{ unlocked_at: Date | null } | undefined>('unlocked_at');
+        if (isSessionLocked('web', true, session?.unlocked_at ?? null)) {
+          throw this.locked();
+        }
+      }
+
+      const inserted = await trx('user_passkey')
+        .insert({
+          user_id: user.id,
+          credential_id: credential.id,
+          public_key: Buffer.from(credential.publicKey),
+          counter: credential.counter,
+          transports: credential.transports ?? null,
+          device_type: credentialDeviceType,
+          backed_up: credentialBackedUp,
+          name: name?.trim() || 'Passkey',
+        })
+        .onConflict('credential_id')
+        .ignore()
+        .returning('id');
+      if (inserted.length === 0) {
+        throw new BadRequestException({
+          code: 'passkey_exists',
+          message: 'This passkey is already registered.',
+        });
+      }
+
+      // The first passkey locks every other session of the member
+      if (count === 0) {
+        await this.sessions.lockOtherSessions(user.id, user.sessionId!, trx);
+      }
+      await this.sessions.markUnlocked(user.sessionId!, trx);
+    });
     this.logger.log(`Passkey added for user ${user.id}`);
     return this.status({ ...user, locked: false });
   }
@@ -217,6 +237,7 @@ export class PasskeyService {
     response: AuthenticationResponseJSON,
   ): Promise<PasskeyStatus> {
     const rp = this.webOnly(user);
+    this.credentialId(response);
     const taken = await this.sessions.takeChallenge(user.sessionId!, 'unlock');
     if (!taken) throw this.challengeExpired();
     await this.verifyAssertion(user, rp, taken.challenge, response);
@@ -247,6 +268,7 @@ export class PasskeyService {
     response: AuthenticationResponseJSON,
   ): Promise<void> {
     const rp = this.webOnly(user);
+    this.credentialId(response);
     const taken = await this.sessions.takeChallenge(user.sessionId!, 'approve');
     if (!taken) throw this.approvalRequired();
     if (taken.action !== action) {
@@ -311,7 +333,7 @@ export class PasskeyService {
     response: AuthenticationResponseJSON,
   ): Promise<void> {
     const row = await this.knex('user_passkey')
-      .where({ user_id: user.id, credential_id: String(response?.id ?? '') })
+      .where({ user_id: user.id, credential_id: this.credentialId(response) })
       .first<PasskeyRow | undefined>();
     // Someone else's passkey, or one that was removed
     if (!row) throw this.notVerified();
@@ -339,10 +361,16 @@ export class PasskeyService {
     }
     if (!verified.verified) throw this.notVerified();
 
-    await this.knex('user_passkey').where({ id: row.id }).update({
-      counter: verified.authenticationInfo.newCounter,
-      last_used_at: new Date(),
-    });
+    await this.knex('user_passkey')
+      .where({ id: row.id })
+      .update({
+        // Two approvals verified side by side may finish out of order: keep
+        // the highest counter (0 stays 0 for authenticators without one)
+        counter: this.knex.raw('GREATEST(counter, ?)', [
+          verified.authenticationInfo.newCounter,
+        ]),
+        last_used_at: new Date(),
+      });
   }
 
   /** Remove one (an unlocked web session only); the last one turns the lock off */
@@ -398,12 +426,30 @@ export class PasskeyService {
   }
 
   private assertUnlocked(user: RequestUser): void {
-    if (user.locked) {
-      throw new ForbiddenException({
-        code: 'passkey_required',
-        message: 'Unlock with your passkey to continue.',
-      });
+    if (user.locked) throw this.locked();
+  }
+
+  private locked() {
+    return new ForbiddenException({
+      code: 'passkey_required',
+      message: 'Unlock with your passkey to continue.',
+    });
+  }
+
+  private limitReached() {
+    return new BadRequestException({
+      code: 'passkey_limit',
+      message: `You can have up to ${MAX_PASSKEYS} passkeys. Remove one first.`,
+    });
+  }
+
+  /** A WebAuthn response's credential id: a nonempty string, or 400 */
+  private credentialId(response: { id?: unknown } | undefined): string {
+    const id = response?.id;
+    if (typeof id !== 'string' || id.length === 0 || id.length > 1024) {
+      throw this.notVerified();
     }
+    return id;
   }
 
   private setupRequired() {

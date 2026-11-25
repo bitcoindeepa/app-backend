@@ -5,6 +5,7 @@ import {
   Get,
   HttpCode,
   HttpStatus,
+  Logger,
   BadRequestException,
   NotFoundException,
   Param,
@@ -19,6 +20,7 @@ import {
 import { SessionRequiredGuard } from '../auth/session-required.guard';
 import { AdminKeyGuard } from '../auth/admin-key.guard';
 import { CurrentUser } from '../auth/user.decorator';
+import { errorMessage } from '../../common/error-message';
 import { TelegramLoggerService } from '../telegram-logger/telegram-logger.service';
 import {
   ApprovalOptionsDto,
@@ -42,6 +44,8 @@ type RequestUser = RequestWithUser['user'];
  */
 @Controller('passkey')
 export class PasskeyController {
+  private readonly logger = new Logger(PasskeyController.name);
+
   constructor(
     private readonly passkeys: PasskeyService,
     private readonly telegramLogger: TelegramLoggerService,
@@ -64,10 +68,13 @@ export class PasskeyController {
   @Post('register')
   @UseGuards(ConditionalAuthGuard, SessionRequiredGuard)
   @HttpCode(HttpStatus.OK)
-  register(@CurrentUser() user: RequestUser, @Body() body: RegisterPasskeyDto) {
-    return this.telegramLogger.trackAction('🔐 Passkey added', user, () =>
-      this.passkeys.register(user, body.response, body.name),
-    );
+  async register(
+    @CurrentUser() user: RequestUser,
+    @Body() body: RegisterPasskeyDto,
+  ) {
+    const status = await this.passkeys.register(user, body.response, body.name);
+    this.logAction('🔐 Passkey added', user);
+    return status;
   }
 
   @Post('unlock/options')
@@ -110,13 +117,13 @@ export class PasskeyController {
   /** Remove one (needs an unlocked web session); removing the last turns the lock off */
   @Delete(':id')
   @UseGuards(ConditionalAuthGuard, SessionRequiredGuard)
-  remove(
+  async remove(
     @CurrentUser() user: RequestUser,
     @Param('id', new ParseUUIDPipe({ version: '4' })) id: string,
   ) {
-    return this.telegramLogger.trackAction('🔐 Passkey removed', user, () =>
-      this.passkeys.remove(user, id),
-    );
+    const status = await this.passkeys.remove(user, id);
+    this.logAction('🔐 Passkey removed', user);
+    return status;
   }
 
   /**
@@ -130,5 +137,17 @@ export class PasskeyController {
     const removed = await this.passkeys.adminReset(userId);
     if (!removed) throw new NotFoundException('No passkeys for this user');
     return { removed };
+  }
+
+  /**
+   * Ops log after the change is done, without waiting for Telegram: a slow
+   * or failing Telegram call never delays or fails the passkey request
+   */
+  private logAction(action: string, user: RequestUser): void {
+    void this.telegramLogger
+      .logGenericAction(action, user)
+      .catch((error: unknown) =>
+        this.logger.warn(`Telegram log failed: ${errorMessage(error)}`),
+      );
   }
 }

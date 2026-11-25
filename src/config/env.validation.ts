@@ -121,7 +121,8 @@ class EnvironmentVariables {
   // Domain passkeys are bound to (WebAuthn RP ID). Defaults to APP_URL's
   // host; set it to the parent domain (bitcoindeepa.com) so every subdomain
   // shares them. Changing it later orphans every registered passkey.
-  @IsOptional()
+  // Empty (as in .env.template) = unset: skip the pattern
+  @ValidateIf((env: EnvironmentVariables) => !!env.WEBAUTHN_RP_ID)
   @Matches(/^(?=.{1,253}$)[a-z0-9-]+(\.[a-z0-9-]+)*$/i)
   WEBAUTHN_RP_ID?: string;
 
