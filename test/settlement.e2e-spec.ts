@@ -1160,6 +1160,53 @@ describe('Settlement (e2e)', () => {
     );
   });
 
+  it('a hold set after the claim keeps an unrecorded attempt’s null marker, so releasing it does not resend blind', async () => {
+    const alert = jest.spyOn(ctx.app.get(TelegramLoggerService), 'logAlert');
+    // The previous release (another memo) sent it and recorded nothing
+    await ctx
+      .knex('transaction')
+      .where({ payhere_pay_id: 'P1' })
+      .update({
+        retry_count: 1,
+        last_retry_at: new Date(0),
+        settlement_failure: null,
+      });
+    // The attempt is claimed; a human holds the payment during the lookup
+    ctx.payHerePayments.mockImplementationOnce(async () => {
+      await ctx
+        .knex('transaction')
+        .where({ payhere_pay_id: 'P1' })
+        .update({ hold_reason: 'check me' });
+      return [
+        {
+          payment_id: 'P1',
+          status: 'RECEIVED',
+          amount: '1000.00',
+          order_id: null,
+        },
+      ];
+    });
+    ctx.bitcoinDeepa.findSettlementTransfer.mockResolvedValueOnce(null);
+    await settlement.retryUnsettledTransactions();
+    expect(ctx.bitcoinDeepa.transferFunds).not.toHaveBeenCalled();
+    expect(await tx()).toMatchObject({
+      settled: false,
+      settlement_failure: null,
+    });
+    expect(alerted(alert, "couldn't be looked up. Check the bot")).toBe(true);
+
+    // The hold is released; the bot history still can't be read
+    await ctx
+      .knex('transaction')
+      .where({ payhere_pay_id: 'P1' })
+      .update({ hold_reason: null, last_retry_at: new Date(0) });
+    ctx.bitcoinDeepa.findSettlementTransfer.mockResolvedValueOnce(null);
+    await settlement.retryUnsettledTransactions();
+    expect(ctx.bitcoinDeepa.transferFunds).not.toHaveBeenCalled();
+    expect(await tx()).toMatchObject({ settled: false });
+    alert.mockRestore();
+  });
+
   it('says so when a chargeback lands during the transfer itself', async () => {
     const alert = jest.spyOn(ctx.app.get(TelegramLoggerService), 'logAlert');
     ctx.bitcoinDeepa.transferFunds.mockImplementationOnce(async () => {

@@ -47,19 +47,19 @@ export function truncateText(text: string, max: number): string {
 }
 
 /**
- * `text` escaped, cut so the escaped form is at most `max` characters
- * (counted escaped, which is never less than what Telegram counts), so a cut
- * never lands inside an entity
+ * `text` escaped, cut so the text Telegram counts (after it parses the HTML
+ * entities) is at most `max` characters. Each kept character is escaped on
+ * its own, so a cut never lands inside an entity
  */
 function escapeWithin(text: string, max: number): string {
-  const escaped = escapeHtml(text);
-  if (escaped.length <= max) return escaped;
+  if (text.length <= max) return escapeHtml(text);
   if (max <= 0) return '';
   let out = '';
+  let kept = 0;
   for (const ch of text) {
-    const e = escapeHtml(ch);
-    if (out.length + e.length > max - 1) break;
-    out += e;
+    if (kept + ch.length > max - 1) break;
+    out += escapeHtml(ch);
+    kept += ch.length;
   }
   return `${out}…`;
 }
@@ -121,8 +121,17 @@ export interface AlertDetails {
   richHtml?: string;
 }
 
-const fieldValue = ([, value, style]: AlertField) =>
-  style === 'code' ? `<code>${escapeHtml(value)}</code>` : escapeHtml(value);
+/**
+ * Field values can be unbounded (a bot's error message): each is cut, before
+ * escaping so no entity is split, so the fields alone can't push the plain
+ * fallback past Telegram's limit
+ */
+export const MAX_FIELD_VALUE_CHARS = 500;
+
+const fieldValue = ([, value, style]: AlertField) => {
+  const shown = escapeHtml(truncateText(value, MAX_FIELD_VALUE_CHARS));
+  return style === 'code' ? `<code>${shown}</code>` : shown;
+};
 
 /** Plain text as rich paragraphs, one per non-empty line (escaped) */
 export function richParagraphs(text: string): string {

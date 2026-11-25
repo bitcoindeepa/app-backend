@@ -42,7 +42,8 @@ const paymentFields = (
   userId: string | null,
 ): AlertField[] => [
   ['Payment', paymentId, 'code'],
-  ['Sats', Number(sats).toLocaleString('en-US')],
+  // whole sats: exact as a double
+  ['Sats', toApiNumber(sats).toLocaleString('en-US')],
   ['User', `#UID${userId ?? '?'}`],
 ];
 
@@ -380,10 +381,14 @@ export class SettlementService {
           if (found) {
             await this.markSettled(payhere_pay_id);
           } else {
-            // Put back the marker the claim cleared
+            // Put back the marker the claim cleared, as it was (like the
+            // not-confirmed path above). Not 'UNKNOWN' for a null one: null
+            // (an attempt nobody recorded, maybe with another memo) is what
+            // stops a blind resend after the hold is released while the bot
+            // history can't be read
             await this.knexService
               .knex('transaction')
-              .update({ settlement_failure: 'UNKNOWN' })
+              .update({ settlement_failure: transaction.settlement_failure })
               .where('payhere_pay_id', payhere_pay_id)
               .where('retry_count', currentRetryCount);
             await this.telegramLogger.logAlert(

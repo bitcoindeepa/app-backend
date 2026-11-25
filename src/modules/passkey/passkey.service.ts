@@ -244,8 +244,7 @@ export class PasskeyService {
     this.credentialId(response);
     const taken = await this.sessions.takeChallenge(user.sessionId!, 'unlock');
     if (!taken) throw this.challengeExpired();
-    await this.verifyAssertion(user, rp, taken.challenge, response);
-    await this.sessions.markUnlocked(user.sessionId!);
+    await this.verifyAssertionAndUnlock(user, rp, taken.challenge, response);
     return this.status({ ...user, locked: false });
   }
 
@@ -281,8 +280,7 @@ export class PasskeyService {
       );
       throw this.approvalRequired();
     }
-    await this.verifyAssertion(user, rp, taken.challenge, response);
-    await this.sessions.markUnlocked(user.sessionId!);
+    await this.verifyAssertionAndUnlock(user, rp, taken.challenge, response);
   }
 
   /**
@@ -329,8 +327,15 @@ export class PasskeyService {
     return options;
   }
 
-  /** Verify a WebAuthn assertion by one of the member's passkeys; bumps its counter */
-  private async verifyAssertion(
+  /**
+   * Verify a WebAuthn assertion by one of the member's passkeys, then bump
+   * its counter and unlock this session. The last two run under the member's
+   * user row lock (the one register() holds) and only if the passkey still
+   * exists: one removed or replaced while the assertion was being checked
+   * must not leave this session unlocked (register's first-passkey rule
+   * locks the other sessions, and a late unlock would undo that).
+   */
+  private async verifyAssertionAndUnlock(
     user: RequestUser,
     rp: RelyingParty,
     challenge: string,
@@ -374,16 +379,26 @@ export class PasskeyService {
     }
     if (!verified.verified) throw this.notVerified();
 
-    await this.knex('user_passkey')
-      .where({ id: row.id })
-      .update({
-        // Two approvals verified side by side may finish out of order: keep
-        // the highest counter (0 stays 0 for authenticators without one)
-        counter: this.knex.raw('GREATEST(counter, ?)', [
-          verified.authenticationInfo.newCounter,
-        ]),
-        last_used_at: new Date(),
-      });
+    await this.knex.transaction(async (trx) => {
+      await trx('user').where('id', user.id).forNoKeyUpdate().first('id');
+      const updated = await trx('user_passkey')
+        .where({ id: row.id, user_id: user.id })
+        .update({
+          // Two approvals verified side by side may finish out of order: keep
+          // the highest counter (0 stays 0 for authenticators without one)
+          counter: trx.raw('GREATEST(counter, ?)', [
+            verified.authenticationInfo.newCounter,
+          ]),
+          last_used_at: new Date(),
+        });
+      if (updated === 0) {
+        this.logger.warn(
+          `Passkey assertion refused for user ${user.id}: the passkey was removed meanwhile`,
+        );
+        throw this.notVerified();
+      }
+      await this.sessions.markUnlocked(user.sessionId!, trx);
+    });
   }
 
   /**
@@ -444,9 +459,14 @@ export class PasskeyService {
   async remove(user: RequestUser, id: string): Promise<PasskeyStatus> {
     this.webOnly(user);
     this.assertUnlocked(user);
-    const deleted = await this.knex('user_passkey')
-      .where({ id, user_id: user.id })
-      .del();
+    // Under the user row lock, like register() and an unlock, so a removal
+    // and an unlock with that passkey happen one after the other
+    const deleted = await this.knex.transaction(
+      async (trx): Promise<number> => {
+        await trx('user').where('id', user.id).forNoKeyUpdate().first('id');
+        return await trx('user_passkey').where({ id, user_id: user.id }).del();
+      },
+    );
     if (!deleted) throw new NotFoundException('Passkey not found');
     this.logger.log(`Passkey removed for user ${user.id}`);
     return this.status(user);

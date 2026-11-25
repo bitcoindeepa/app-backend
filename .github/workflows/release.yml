@@ -6,11 +6,16 @@ name: release
 # main whose version is already tagged does nothing.
 #
 # Pushing a vX.Y.Z tag by hand still publishes that tag; re-run (or run by
-# hand with an existing tag) to update a release's notes.
+# hand with an existing tag) to update a release's notes. A push to main that
+# only fixes CHANGELOG.md also runs it, so a release that failed for a
+# missing section is retried by adding the section.
+#
+# Only a push to main picks the version from package.json; a manual run
+# always publishes the tag it was given, with main's notes.
 on:
   push:
     branches: [main]
-    paths: [package.json]
+    paths: [package.json, CHANGELOG.md]
     tags: ['v*.*.*']
   workflow_dispatch:
     inputs:
@@ -24,6 +29,9 @@ permissions:
 concurrency:
   group: release
   cancel-in-progress: false
+  # Keep every pending run (by default a third run replaces the pending one,
+  # and a version bump could lose its release)
+  queue: max
 
 jobs:
   release:
@@ -35,12 +43,12 @@ jobs:
         with:
           # A version bump releases exactly the commit that was pushed; a tag
           # or a manual run reads the notes from main's CHANGELOG.md
-          ref: ${{ github.ref_type == 'branch' && github.sha || 'main' }}
+          ref: ${{ (github.event_name == 'push' && github.ref_type == 'branch') && github.sha || 'main' }}
 
       - name: Which tag
         id: tag
         run: |
-          if [ "$GITHUB_REF_TYPE" = branch ]; then
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_TYPE" = branch ]; then
             version=$(jq -r .version package.json)
             if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
               echo "::error::package.json version '$version' isn't X.Y.Z"; exit 1

@@ -10,6 +10,7 @@ To release: add the version's section below, bump `version` in `package.json`, a
 
 ### New
 
+- **Passkeys for the web app** (Face ID, fingerprint or device PIN, `/passkey/*`). Every send (`POST /p2p/send`) and sale payment (`POST /sell/orders/:id/pay`) from the web needs a passkey approval for exactly that action, sent in `X-Passkey-Assertion`. A member can also lock the app: a locked web session can't add or remove bank accounts until it unlocks (12 h). Support can remove a member's passkeys with `POST /passkey/admin-reset/:userId`. The Mini App is never gated: Telegram's webview can't run passkeys for our domain (#153)
 - **Savings pots**: the bot's balance now includes `pot_balance` and `pots`. Sell quotes only use spendable sats, and `dca-summary` returns `spendable_balance`, `pot_balance` and `pots`. A bot without these fields keeps the old behaviour (#149)
 - Admins get a Telegram alert when a member's KYC attempt is declined (#80)
 - Settlement handles each bot refusal by type: `APPROVAL_DELIVERY` and `BUSY` retry on a slower schedule, `OVER_LIMIT` and `NO_WALLET` stop for a human (#143)
@@ -17,12 +18,13 @@ To release: add the version's section below, bump `version` in `package.json`, a
 - Alerts that need a human go to `ALERT_TOPIC_ID` (defaults to `LOG_TOPIC_ID`) (#75)
 - Clearer errors from the PayHere API
 - Hotfixes merged to `main` open a back-merge PR into `dev` automatically (#81)
-- Bumping `version` in `package.json` on `main` tags and publishes the release automatically
+- Bumping `version` in `package.json` on `main` tags and publishes the release automatically. A push that only adds a missing CHANGELOG section retries it, pending release runs are queued instead of replaced, and a manual run always publishes the tag it was given
 
 ### Changed
 
+- **The backend runs on Node 22** (the Dockerfile was still on Node 18, which passkeys can't run on) (#154)
 - All money arithmetic uses bignumber.js through `src/common/money.ts` (#74)
-- `package.amount` is `decimal(18, 2)` instead of a float; API responses are unchanged (#79, #146)
+- `package.amount` stays a float in this release; every API response already converts it, so the switch to `decimal(18, 2)` ships in the next release (#79, #146)
 - `dca-summary` is cached for 10 s instead of 5 min, so wallet and pot changes show on refresh (#151)
 - Sales and purchases are linked to their bot transfers by payment hash (#71)
 - Members are named in logs by Telegram link and app username, without mentions (#144)
@@ -31,7 +33,10 @@ To release: add the version's section below, bump `version` in `package.json`, a
 
 ### Fixed
 
-- Settlement no longer overwrites an unrecorded attempt's marker with `UNKNOWN` when PayHere hasn't confirmed the payment, which could have allowed a double payout
+- **Possible double payout**: settlement no longer overwrites an unrecorded attempt's marker with `UNKNOWN`, either when PayHere hasn't confirmed the payment or when the payment was held or charged back during the attempt. That marker is what stops a blind resend while the bot history can't be read
+- A passkey removed or replaced while an unlock or approval was being checked can no longer leave that session unlocked
+- Telegram's plain-text alert fallback counts characters as Telegram does, and long field values (such as a bot error message) are cut, so the fallback is no longer cut early or refused for being too long
+- `/transaction/latest` returns `package_amount` as a number whatever the column type
 
 ### Security
 
@@ -39,13 +44,17 @@ To release: add the version's section below, bump `version` in `package.json`, a
 
 ### Upgrading
 
-- 2 new migrations, applied on startup in production:
-  - `20261205000000_package_amount_decimal` (#79)
+- **Production moves from Node 18 to Node 22** with this release (#154)
+- 3 migrations, applied on startup in production, all safe while 2.0.1 is still serving:
+  - `20261205000000_package_amount_decimal`: now a no-op (kept because development databases already ran it)
   - `20261205000001_more_settlement_failure_reasons`: widens the `settlement_failure` CHECK, added `NOT VALID` so the table isn't scanned under lock (#143)
+  - `20261206000000_create_user_passkey`: the `user_passkey` table and nullable passkey columns on `user_session` (#153)
+- New optional env var `WEBAUTHN_RP_ID`: the domain passkeys are bound to (default `APP_URL`'s host). **Set it before the first passkey is registered**: changing it later orphans every passkey
+- Deploy the backend before the frontend: the app reads the new `dca-summary` fields and the passkey routes
 
 ## [2.0.1] - 2026-11-20
 
-## New
+### New
 
 - **Manage admins from the dashboard**: `GET /admin/admins` lists admins and `POST /admin/admins` adds one (password at least 12 characters; 409 for a duplicate email) (#66)
 - **Flat bank charge on sales**: each sale now deducts `SELL_BANK_CHARGE_LKR` (default Rs.30) after the fee. It is stored on the order as `bank_charge_lkr`, and `amount_lkr` is gross minus fee minus bank charge (#67)
@@ -94,6 +103,7 @@ The 2.0 release: selling sats for LKR, one-time buys, P2P sends, an admin dashbo
 - **Deploy with the matching bot build**: the bot rejects V1-signed `/p2p/*` calls, and sends are Ed25519-signed.
 - Register `BASE_URL/auth/telegram/callback` in BotFather for web login, and create the first dashboard admin with `bun run admin:create`.
 
-[Unreleased]: https://github.com/bitcoindeepa/app-backend/compare/v2.0.1...HEAD
+[Unreleased]: https://github.com/bitcoindeepa/app-backend/compare/v2.0.2...HEAD
+[2.0.2]: https://github.com/bitcoindeepa/app-backend/compare/v2.0.1...v2.0.2
 [2.0.1]: https://github.com/bitcoindeepa/app-backend/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/bitcoindeepa/app-backend/compare/5b13b46...v2.0.0

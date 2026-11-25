@@ -344,6 +344,39 @@ describe('Passkeys (e2e)', () => {
       expect(send.body.code).toBe('passkey_setup_required');
     });
 
+    it('does not unlock with a passkey removed while its assertion was being checked', async () => {
+      const laptop = await webSession();
+      const { key } = await register(laptop);
+      const browser = await webSession();
+
+      // The laptop removes the passkey (and holds the member's row) while the
+      // browser's unlock is in flight
+      const trx = await ctx.knex.transaction();
+      await trx('user').where('id', USER).forNoKeyUpdate().first('id');
+      await trx('user_passkey').where({ user_id: USER }).del();
+      const pending = unlock(browser, key, 400);
+      // wait until the unlock is blocked behind those locks
+      for (let i = 0; i < 100; i++) {
+        const [{ n }] = await ctx.knex
+          .from('pg_stat_activity')
+          .where({ wait_event_type: 'Lock' })
+          .count<{ n: string }[]>('* as n');
+        if (Number(n) > 0) break;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      await trx.commit();
+
+      const res = await pending;
+      expect(res.body.code).toBe('passkey_not_verified');
+      // Only the laptop (which registered) is unlocked
+      const unlocked = await ctx
+        .knex('user_session')
+        .where({ user_id: USER })
+        .whereNotNull('unlocked_at')
+        .count<{ n: string }[]>('* as n');
+      expect(Number(unlocked[0].n)).toBe(1);
+    });
+
     it('rechecks the limit and the lock when the passkey is stored', async () => {
       const web = await webSession();
       const { status } = await register(web);

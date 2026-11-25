@@ -25,6 +25,9 @@ describe('TelegramLoggerService.logAlert', () => {
       },
     };
   };
+  /** What Telegram counts against its limit: the text after it parses the HTML */
+  const parsedLength = (html: string) =>
+    html.replace(/<[^>]+>/g, '').replace(/&(?:lt|gt|amp|quot);/g, '_').length;
   const refused = (status: number) =>
     Promise.resolve({
       ok: false,
@@ -98,13 +101,41 @@ describe('TelegramLoggerService.logAlert', () => {
       { fields: [['User', '#UID42']] },
     );
     const text = call(1).body.text ?? '';
-    expect(text.length).toBeLessThanOrEqual(4096);
+    expect(parsedLength(text)).toBeLessThanOrEqual(4096);
+    // and the cut uses the room: not cut early by the escaped length
+    expect(parsedLength(text)).toBeGreaterThan(4000);
     expect(text.startsWith('⚠️ <b>Waiting for review</b>\nreason: ')).toBe(
       true,
     );
     expect(text.endsWith('…\nUser: #UID42')).toBe(true);
     // never cut inside an entity
     expect(text).not.toMatch(/&(?!amp;|lt;|gt;)/);
+  });
+
+  it('budgets the plain fallback by the characters Telegram counts, not the escaped length', async () => {
+    fetchMock.mockImplementationOnce(() => refused(400));
+    // 1,000 "&" = 5,000 escaped characters but only 1,000 for Telegram: fits
+    const text = '&'.repeat(1000);
+    await new TelegramLoggerService().logAlert('S', text);
+    expect(call(1).body.text).toBe(`⚠️ <b>S</b>\n${'&amp;'.repeat(1000)}`);
+  });
+
+  it('caps each field value, so long fields still leave a plain fallback Telegram accepts', async () => {
+    fetchMock.mockImplementationOnce(() => refused(400));
+    await new TelegramLoggerService().logAlert('Settlement', 'refused', {
+      fields: [
+        ['Bot said', `${'<x>'.repeat(2000)}`],
+        ['Payment', 'P1', 'code'],
+      ],
+    });
+    const rich = call(0).body.rich_message?.html ?? '';
+    const plain = call(1).body.text ?? '';
+    expect(parsedLength(plain)).toBeLessThanOrEqual(4096);
+    expect(plain).toContain('refused');
+    expect(plain.endsWith('…\nPayment: <code>P1</code>')).toBe(true);
+    // 499 characters kept + the ellipsis, cut before escaping
+    expect(plain).toContain(`Bot said: ${'&lt;x&gt;'.repeat(166)}&lt;…`);
+    expect(rich).toContain(`${'&lt;x&gt;'.repeat(166)}&lt;…</td>`);
   });
 
   it('stops trying rich messages once the Bot API says it has no such method', async () => {

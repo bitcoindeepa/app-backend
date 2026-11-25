@@ -1742,8 +1742,16 @@ export class TransactionService {
         .where('t.payhere_sub_id', activeSubscription.payhere_sub_id)
         .orderBy('t.created_at', 'desc')
         .first();
+    if (!result) return null;
 
-    return result ?? null;
+    // package.amount may be a decimal (a string from pg): keep the numeric
+    // API field, like /transaction/list (2-dp LKR, exact as a double)
+    return {
+      ...result,
+      package_amount: toApiNumberOrNull(
+        result.package_amount as string | number | null,
+      ),
+    };
   }
 
   async getDCASummaryForUser(user_id: string): Promise<DcaSummary> {
