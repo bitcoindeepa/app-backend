@@ -8,8 +8,10 @@ import { Cron, CronExpression } from '@nestjs/schedule';
 import { createHash, timingSafeEqual } from 'crypto';
 import type { Knex } from 'knex';
 import {
+  ROUND_DOWN,
   SATOSHIS_PER_BTC,
   isAmount,
+  lkr,
   sameAmount,
   toApiNumber,
   toApiNumberOrNull,
@@ -17,7 +19,10 @@ import {
 } from '../../common/money';
 import { KnexService } from '../knex/knex.service';
 import { Subscription } from '../../models/subscription';
-import { BitcoinPriceService } from '../bitcoin-price/bitcoin-price.service';
+import {
+  BitcoinPriceService,
+  lkrValueOfSats,
+} from '../bitcoin-price/bitcoin-price.service';
 import { RedisService } from '../redis/redis.service';
 import { CacheKeys } from '../redis/utils/cache-keys.util';
 import { TelegramLoggerService } from '../telegram-logger/telegram-logger.service';
@@ -1838,7 +1843,7 @@ export class TransactionService {
     user_id: string,
   ): Promise<Omit<DcaSummary, 'dca' | 'currency'>> {
     let total_balance = 0;
-    let total_lkr = '0.00';
+    let botLkr = '0.00';
     let balance_available = false;
     let spendable_balance = 0;
     let pot_balance = 0;
@@ -1849,7 +1854,11 @@ export class TransactionService {
       );
       if (balance.success) {
         total_balance = balance.balance ?? 0;
-        total_lkr = balance.balance_lkr ?? '0.00';
+        // The bot sends "30,342.75"; store it like our own figure ("30342.75")
+        // so total_lkr has one format whichever price it came from.
+        botLkr = isAmount(balance.balance_lkr)
+          ? lkr(toMoney(balance.balance_lkr), ROUND_DOWN).toFixed(2)
+          : '0.00';
         balance_available = true;
         spendable_balance = spendableSats(balance) ?? 0;
         pot_balance = potSats(balance);
@@ -1863,6 +1872,15 @@ export class TransactionService {
       this.bitcoinPriceService.getBtcLkrRate(),
       this.bitcoinPriceService.getBitcoin24HrChange(),
     ]);
+
+    // The balance in LKR at our own BTC/LKR, like buys, sells and the rest of
+    // the app. The bot's balance_lkr uses another BTC/USD source and the bank
+    // USD selling rate (~1% higher), so it's only a fallback while our price
+    // is down.
+    const total_lkr =
+      balance_available && rate
+        ? lkrValueOfSats(total_balance, rate.btcLkr)
+        : botLkr;
 
     return {
       total_balance,

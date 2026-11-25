@@ -7,6 +7,7 @@ import {
   fallbackMaxAgeSeconds,
   CHANGE_24H_PERSISTENT_FAILURE_TTL_SECONDS,
   FAILURE_CACHE_TTL_SECONDS,
+  lkrValueOfSats,
   satoshisFor,
 } from './bitcoin-price.service';
 import { KnexService } from '../knex/knex.service';
@@ -36,6 +37,24 @@ describe('satoshisFor', () => {
     expect(Math.floor((128.7 / 21_450_000) * 100_000_000)).toBe(599);
     expect(satoshisFor(128.7, 21_450_000)).toBe(600);
     expect(satoshisFor(47.19, 21_450_000)).toBe(220);
+  });
+});
+
+describe('lkrValueOfSats', () => {
+  it('is sats / 1e8 × BTC/LKR, rounded down to cents, as a 2-dp string', () => {
+    // 152,340 / 1e8 × 19,654,342.20 = 29,941.4249...
+    expect(lkrValueOfSats(152_340, 19_654_342.2)).toBe('29941.42');
+    expect(lkrValueOfSats('152340', '19654342.20')).toBe('29941.42');
+    expect(lkrValueOfSats(600, 21_450_000)).toBe('128.70');
+    expect(lkrValueOfSats(0, 21_450_000)).toBe('0.00');
+  });
+
+  it('is exact where float math comes out a cent short', () => {
+    // Exactly 30.03; with floats 140 / 1e8 × 21,450,000 is 30.029999...
+    expect(Math.floor((140 / 100_000_000) * 21_450_000 * 100) / 100).toBe(
+      30.02,
+    );
+    expect(lkrValueOfSats(140, 21_450_000)).toBe('30.03');
   });
 });
 

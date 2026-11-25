@@ -256,6 +256,80 @@ describe('isPurchaseSettlement', () => {
   });
 });
 
+describe('wallet summary total_lkr', () => {
+  const rate = { btcLkr: 19_654_342.2, btcUsd: 59_182, usdtLkr: 332.1 };
+  const botBalance = {
+    success: true,
+    balance: 152_340,
+    // The bot prices with another BTC/USD and the bank USD rate (~1% more)
+    balance_lkr: '30,342.75',
+  };
+
+  const serviceWith = ({
+    btcLkr = rate as typeof rate | null,
+    balance = botBalance as Record<string, unknown>,
+  } = {}) =>
+    new TransactionService(
+      {} as never,
+      {
+        getBtcLkrRate: jest.fn().mockResolvedValue(btcLkr),
+        getBitcoin24HrChange: jest.fn().mockResolvedValue(1.8),
+      } as never,
+      {} as never,
+      {} as never,
+      {
+        isConfigured: () => true,
+        getUserBalance: jest.fn().mockResolvedValue(balance),
+      } as never,
+      {} as never,
+    );
+
+  // The method under test is private: it's all the summary's market part
+  const market = (service: TransactionService) =>
+    service['fetchBalanceAndMarket']('1001');
+
+  it('prices the balance with our own BTC/LKR, not the bot’s balance_lkr', async () => {
+    await expect(market(serviceWith())).resolves.toMatchObject({
+      total_balance: 152_340,
+      total_lkr: '29941.42',
+      balance_available: true,
+      current_btc_price: { usd: 59_182, lkr: 19_654_342.2 },
+    });
+  });
+
+  it('falls back to the bot’s figure while our price is down, in the same format', async () => {
+    await expect(market(serviceWith({ btcLkr: null }))).resolves.toMatchObject({
+      total_balance: 152_340,
+      // The bot sends '30,342.75': no thousands separators, like our own figure
+      total_lkr: '30342.75',
+      current_btc_price: undefined,
+    });
+  });
+
+  it('falls back to 0.00 when the bot sends no usable balance_lkr', async () => {
+    for (const balance_lkr of [undefined, '', 'n/a']) {
+      await expect(
+        market(
+          serviceWith({
+            btcLkr: null,
+            balance: { ...botBalance, balance_lkr },
+          }),
+        ),
+      ).resolves.toMatchObject({ total_lkr: '0.00' });
+    }
+  });
+
+  it('stays 0.00 when the wallet balance is unavailable', async () => {
+    await expect(
+      market(serviceWith({ balance: { success: false } })),
+    ).resolves.toMatchObject({
+      total_balance: 0,
+      total_lkr: '0.00',
+      balance_available: false,
+    });
+  });
+});
+
 describe('TransactionService wallet balance (dca-summary)', () => {
   const build = (balance: Record<string, unknown>) => {
     const bitcoinDeepa = {
