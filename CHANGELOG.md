@@ -6,6 +6,13 @@ To release: add the version's section below, bump `version` in `package.json`, a
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-11-26
+
+### New
+
+- **Choose whether the web app asks for the passkey on open**: `GET /passkey` returns `lock_on_open`, and `PATCH /passkey/settings { lock_on_open }` changes it for all of the member's web sessions. Turning it off needs an unlocked session (403 `passkey_required`); turning it on doesn't. It is on by default and turns on again when a member adds their first passkey. Sends, sale payments, bank account and passkey changes still need a passkey whatever the setting (#156)
+- OpenSSF Scorecard workflow (#145)
+
 ## [2.0.2] - 2026-11-25
 
 ### New
@@ -105,7 +112,8 @@ The 2.0 release: selling sats for LKR, one-time buys, P2P sends, an admin dashbo
 - **Deploy with the matching bot build**: the bot rejects V1-signed `/p2p/*` calls, and sends are Ed25519-signed.
 - Register `BASE_URL/auth/telegram/callback` in BotFather for web login, and create the first dashboard admin with `bun run admin:create`.
 
-[Unreleased]: https://github.com/bitcoindeepa/app-backend/compare/v2.0.2...HEAD
+[Unreleased]: https://github.com/bitcoindeepa/app-backend/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/bitcoindeepa/app-backend/compare/v2.0.2...v2.1.0
 [2.0.2]: https://github.com/bitcoindeepa/app-backend/compare/v2.0.1...v2.0.2
 [2.0.1]: https://github.com/bitcoindeepa/app-backend/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/bitcoindeepa/app-backend/compare/5b13b46...v2.0.0
