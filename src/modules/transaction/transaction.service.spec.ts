@@ -297,12 +297,26 @@ describe('wallet summary total_lkr', () => {
     });
   });
 
-  it('falls back to the bot’s figure while our price is down', async () => {
+  it('falls back to the bot’s figure while our price is down, in the same format', async () => {
     await expect(market(serviceWith({ btcLkr: null }))).resolves.toMatchObject({
       total_balance: 152_340,
-      total_lkr: '30,342.75',
+      // The bot sends '30,342.75': no thousands separators, like our own figure
+      total_lkr: '30342.75',
       current_btc_price: undefined,
     });
+  });
+
+  it('falls back to 0.00 when the bot sends no usable balance_lkr', async () => {
+    for (const balance_lkr of [undefined, '', 'n/a']) {
+      await expect(
+        market(
+          serviceWith({
+            btcLkr: null,
+            balance: { ...botBalance, balance_lkr },
+          }),
+        ),
+      ).resolves.toMatchObject({ total_lkr: '0.00' });
+    }
   });
 
   it('stays 0.00 when the wallet balance is unavailable', async () => {

@@ -8,8 +8,10 @@ import { Cron, CronExpression } from '@nestjs/schedule';
 import { createHash, timingSafeEqual } from 'crypto';
 import type { Knex } from 'knex';
 import {
+  ROUND_DOWN,
   SATOSHIS_PER_BTC,
   isAmount,
+  lkr,
   sameAmount,
   toApiNumber,
   toApiNumberOrNull,
@@ -1844,7 +1846,11 @@ export class TransactionService {
       );
       if (balance.success) {
         total_balance = balance.balance ?? 0;
-        botLkr = balance.balance_lkr ?? '0.00';
+        // The bot sends "30,342.75"; store it like our own figure ("30342.75")
+        // so total_lkr has one format whichever price it came from.
+        botLkr = isAmount(balance.balance_lkr)
+          ? lkr(toMoney(balance.balance_lkr), ROUND_DOWN).toFixed(2)
+          : '0.00';
         balance_available = true;
         spendable_balance = spendableSats(balance) ?? 0;
         pot_balance = potSats(balance);
