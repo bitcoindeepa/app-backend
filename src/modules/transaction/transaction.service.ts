@@ -17,7 +17,10 @@ import {
 } from '../../common/money';
 import { KnexService } from '../knex/knex.service';
 import { Subscription } from '../../models/subscription';
-import { BitcoinPriceService } from '../bitcoin-price/bitcoin-price.service';
+import {
+  BitcoinPriceService,
+  lkrValueOfSats,
+} from '../bitcoin-price/bitcoin-price.service';
 import { RedisService } from '../redis/redis.service';
 import { CacheKeys } from '../redis/utils/cache-keys.util';
 import { TelegramLoggerService } from '../telegram-logger/telegram-logger.service';
@@ -1813,7 +1816,7 @@ export class TransactionService {
     user_id: string,
   ): Promise<Omit<DcaSummary, 'dca' | 'currency'>> {
     let total_balance = 0;
-    let total_lkr = '0.00';
+    let botLkr = '0.00';
     let balance_available = false;
     if (this.bitcoinDeepaService.isConfigured()) {
       const balance = await this.bitcoinDeepaService.getUserBalance(
@@ -1821,7 +1824,7 @@ export class TransactionService {
       );
       if (balance.success) {
         total_balance = balance.balance ?? 0;
-        total_lkr = balance.balance_lkr ?? '0.00';
+        botLkr = balance.balance_lkr ?? '0.00';
         balance_available = true;
       }
     }
@@ -1832,6 +1835,15 @@ export class TransactionService {
       this.bitcoinPriceService.getBtcLkrRate(),
       this.bitcoinPriceService.getBitcoin24HrChange(),
     ]);
+
+    // The balance in LKR at our own BTC/LKR, like buys, sells and the rest of
+    // the app. The bot's balance_lkr uses another BTC/USD source and the bank
+    // USD selling rate (~1% higher), so it's only a fallback while our price
+    // is down.
+    const total_lkr =
+      balance_available && rate
+        ? lkrValueOfSats(total_balance, rate.btcLkr)
+        : botLkr;
 
     return {
       total_balance,

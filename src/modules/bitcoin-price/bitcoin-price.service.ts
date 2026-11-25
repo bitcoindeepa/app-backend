@@ -128,6 +128,21 @@ export const satoshisFor = (
     ),
   );
 
+/**
+ * What `satoshis` are worth in LKR at `btcLkr` (LKR per BTC), rounded down
+ * to cents, as a 2-dp string: the wallet's `total_lkr`. Priced like a sale's
+ * gross (sats / 1e8 × rate, rounded down), so the wallet shows what selling
+ * those sats would price at before the fee and bank charge.
+ */
+export const lkrValueOfSats = (
+  satoshis: number | string,
+  btcLkr: number | string,
+): string =>
+  lkr(
+    toMoney(satoshis).div(SATOSHIS_PER_BTC).times(toMoney(btcLkr)),
+    ROUND_DOWN,
+  ).toFixed(2);
+
 const failureKey = (key: string): string => `${key}:failed`;
 
 /**
