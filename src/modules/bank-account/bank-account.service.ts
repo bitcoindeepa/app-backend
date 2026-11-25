@@ -48,11 +48,17 @@ const beingApproved = () =>
     'This bank account is being approved. Try again in a minute.',
   );
 /**
- * How long an approve holds its claim on an account (`approving_at`). Its
- * CeyPay calls (at most 3) take up to 3 × `CEYPAY_TIMEOUT`, plus a margin, and
- * never less than 120s; a claim older than this is from an approve that
- * crashed, and another approve may take it. Derived from the timeout, so a
- * slow but live approve is never taken over mid-call.
+ * How long an approve holds its claim on an account (`approving_at`): its
+ * CeyPay calls (at most 3) take up to 3 × `CEYPAY_TIMEOUT`, plus a 30s margin
+ * for the bounded DB steps around them, and never less than 120s. A claim
+ * older than this is taken to be from an approve that crashed, and another
+ * approve may take it.
+ *
+ * Not a hard guarantee: an approve stalled past the claim by something
+ * outside these bounds (an exhausted DB pool, a statement timeout) can be
+ * taken over while still running. Our record stays right (step 3 only writes
+ * under its own claim), but CeyPay doesn't dedupe, so both may add the
+ * account there: a duplicate CeyPay bank account, not a wrong payout.
  */
 export const approvalClaimSeconds = (): number =>
   Math.max(120, Math.ceil((3 * ceyPayTimeoutMs()) / 1000) + 30);
