@@ -1,9 +1,16 @@
 name: release
 
-# Push a vX.Y.Z tag to publish its GitHub release, with that version's
-# CHANGELOG.md section as the notes. Re-run (or run by hand) to update one.
+# Bump `version` in package.json (with a matching CHANGELOG.md section) and
+# merge to main: this tags the merge commit vX.Y.Z and publishes its GitHub
+# release, with that version's CHANGELOG.md section as the notes. A push to
+# main whose version is already tagged does nothing.
+#
+# Pushing a vX.Y.Z tag by hand still publishes that tag; re-run (or run by
+# hand with an existing tag) to update a release's notes.
 on:
   push:
+    branches: [main]
+    paths: [package.json]
     tags: ['v*.*.*']
   workflow_dispatch:
     inputs:
@@ -14,18 +21,47 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
-      TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
+          # A version bump releases exactly the commit that was pushed; a tag
+          # or a manual run reads the notes from main's CHANGELOG.md
+          ref: ${{ github.ref_type == 'branch' && github.sha || 'main' }}
+
+      - name: Which tag
+        id: tag
+        run: |
+          if [ "$GITHUB_REF_TYPE" = branch ]; then
+            version=$(jq -r .version package.json)
+            if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "::error::package.json version '$version' isn't X.Y.Z"; exit 1
+            fi
+            tag="v$version"
+            if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+              echo "$tag is already tagged; version wasn't bumped, nothing to release"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          else
+            tag="${{ inputs.tag || github.ref_name }}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Releasing $tag"
 
       - name: Notes from CHANGELOG.md
+        if: steps.tag.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
           version="${TAG#v}"
           awk -v v="$version" '
@@ -34,20 +70,31 @@ jobs:
             on { print }
           ' CHANGELOG.md | sed -e 's/^### /## /' -e 's/^#### /### /' > notes.md
           if ! grep -q '[^[:space:]]' notes.md; then
-            echo "::error::No CHANGELOG.md section for $version"; exit 1
+            echo "::error::No CHANGELOG.md section for $version. Add '## [$version] - YYYY-MM-DD' and push again."
+            exit 1
           fi
-          prev=$(git ls-remote --tags origin 'v*' | sed 's#.*refs/tags/##; s#\^{}##' | sort -uV \
-            | awk -v t="$TAG" '$0 == t { print p; exit } { p = $0 }')
+          # Include TAG itself: a version bump's tag doesn't exist yet
+          tags=$( { git ls-remote --tags origin 'v*' | sed 's#.*refs/tags/##; s#\^{}##'; echo "$TAG"; } | sort -uV)
+          prev=$(printf '%s\n' "$tags" | awk -v t="$TAG" '$0 == t { print p; exit } { p = $0 }')
           [ -n "$prev" ] && printf '\n**Full diff**: %s/compare/%s...%s\n' \
             "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$prev" "$TAG" >> notes.md
+          echo "latest=$(printf '%s\n' "$tags" | tail -1)" >> "$GITHUB_ENV"
           cat notes.md
 
       - name: Publish
+        if: steps.tag.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          NEW: ${{ steps.tag.outputs.new }}
         run: |
-          latest=$(git ls-remote --tags origin 'v*' | sed 's#.*refs/tags/##; s#\^{}##' | sort -uV | tail -1)
+          is_latest=$([ "$TAG" = "$latest" ] && echo true || echo false)
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release edit "$TAG" --title "$TAG" --notes-file notes.md
+          elif [ "$NEW" = true ]; then
+            # Creates the tag on the pushed commit along with the release
+            gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" \
+              --notes-file notes.md --latest="$is_latest"
           else
-            gh release create "$TAG" --verify-tag --title "$TAG" --notes-file notes.md \
-              --latest=$([ "$TAG" = "$latest" ] && echo true || echo false)
+            gh release create "$TAG" --verify-tag --title "$TAG" \
+              --notes-file notes.md --latest="$is_latest"
           fi
