@@ -42,6 +42,33 @@ describe('validateEnv', () => {
     ).not.toThrow();
   });
 
+  it('treats an empty WEBAUTHN_RP_ID as unset and checks a set one', () => {
+    for (const rpId of [undefined, '', 'bitcoindeepa.com', 'app.example.com']) {
+      expect(() =>
+        validateEnv({
+          ...base,
+          NODE_ENV: 'production',
+          ...prodSecrets,
+          WEBAUTHN_RP_ID: rpId,
+        }),
+      ).not.toThrow();
+    }
+    for (const rpId of [
+      'https://bitcoindeepa.com',
+      'bitcoindeepa.com/app',
+      'a b',
+    ]) {
+      expect(() =>
+        validateEnv({
+          ...base,
+          NODE_ENV: 'production',
+          ...prodSecrets,
+          WEBAUTHN_RP_ID: rpId,
+        }),
+      ).toThrow(/WEBAUTHN_RP_ID/);
+    }
+  });
+
   it('requires JWT_SECRET', () => {
     expect(() => validateEnv({})).toThrow(/JWT_SECRET/);
   });

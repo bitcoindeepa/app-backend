@@ -14,18 +14,140 @@ describe('TelegramLoggerService.logAlert', () => {
     global.fetch = fetchMock as unknown as typeof fetch;
   });
 
-  it('escapes the text so Telegram accepts the HTML message', async () => {
+  const call = (i: number) => {
+    const [url, init] = fetchMock.mock.calls[i] as [string, { body: string }];
+    return {
+      method: url.split('/').pop(),
+      body: JSON.parse(init.body) as {
+        text?: string;
+        parse_mode?: string;
+        rich_message?: { html: string };
+      },
+    };
+  };
+  /** What Telegram counts against its limit: the text after it parses the HTML */
+  const parsedLength = (html: string) =>
+    html.replace(/<[^>]+>/g, '').replace(/&(?:lt|gt|amp|quot);/g, '_').length;
+  const refused = (status: number) =>
+    Promise.resolve({
+      ok: false,
+      status,
+      json: () => Promise.resolve({ ok: false, description: 'Bad Request' }),
+    });
+
+  it('sends a rich message: escaped heading, the text as paragraphs', async () => {
+    await new TelegramLoggerService().logAlert(
+      'PayHere <api>',
+      'Error: <html>Bad Gateway</html> & retry\n\nsecond line',
+    );
+    expect(call(0).method).toBe('sendRichMessage');
+    expect(call(0).body.rich_message?.html).toBe(
+      '<h3>⚠️ PayHere &lt;api&gt;</h3><p>Error: &lt;html&gt;Bad Gateway&lt;/html&gt; &amp; retry</p><p>second line</p>',
+    );
+  });
+
+  it('uses the caller rich HTML when given', async () => {
+    await new TelegramLoggerService().logAlert('Waiting for review', 'plain', {
+      richHtml: '<table><tr><td>x</td></tr></table>',
+    });
+    expect(call(0).body.rich_message?.html).toBe(
+      '<h3>⚠️ Waiting for review</h3><table><tr><td>x</td></tr></table>',
+    );
+  });
+
+  it('shows the level icon and title in the heading, and the fields as a table (rich) or lines (plain)', async () => {
+    fetchMock.mockImplementationOnce(() => refused(400));
+    await new TelegramLoggerService().logAlert(
+      'Settlement',
+      'Approve it in the bot chat.',
+      {
+        level: 'waiting',
+        title: 'waiting for approval',
+        fields: [
+          ['Payment', 'P<1>', 'code'],
+          ['User', '#UID42'],
+        ],
+      },
+    );
+    expect(call(0).body.rich_message?.html).toBe(
+      '<h3>⏳ Settlement: waiting for approval</h3><p>Approve it in the bot chat.</p>' +
+        '<table compact><tr><td><b>Payment</b></td><td><code>P&lt;1&gt;</code></td></tr>' +
+        '<tr><td><b>User</b></td><td>#UID42</td></tr></table>',
+    );
+    expect(call(1).body.text).toBe(
+      '⏳ <b>Settlement: waiting for approval</b>\nApprove it in the bot chat.\n' +
+        'Payment: <code>P&lt;1&gt;</code>\nUser: #UID42',
+    );
+  });
+
+  it('falls back to the escaped plain HTML message when the rich one is refused', async () => {
+    fetchMock.mockImplementationOnce(() => refused(400));
     await new TelegramLoggerService().logAlert(
       'PayHere <api>',
       'Error: <html>Bad Gateway</html> & retry',
     );
-    const body = JSON.parse(
-      (fetchMock.mock.calls[0] as [string, { body: string }])[1].body,
-    ) as { text: string; parse_mode: string };
-    expect(body.parse_mode).toBe('HTML');
-    expect(body.text).toBe(
-      '⚠️ <b>ALERT (PayHere &lt;api&gt;)</b>\nError: &lt;html&gt;Bad Gateway&lt;/html&gt; &amp; retry',
+    expect(call(1).method).toBe('sendMessage');
+    expect(call(1).body.parse_mode).toBe('HTML');
+    expect(call(1).body.text).toBe(
+      '⚠️ <b>PayHere &lt;api&gt;</b>\nError: &lt;html&gt;Bad Gateway&lt;/html&gt; &amp; retry',
     );
+  });
+
+  it('cuts the plain fallback to Telegram 4096 characters, keeping the heading and fields', async () => {
+    fetchMock.mockImplementationOnce(() => refused(400));
+    await new TelegramLoggerService().logAlert(
+      'Waiting for review',
+      `reason: ${'<&>'.repeat(3000)}`,
+      { fields: [['User', '#UID42']] },
+    );
+    const text = call(1).body.text ?? '';
+    expect(parsedLength(text)).toBeLessThanOrEqual(4096);
+    // and the cut uses the room: not cut early by the escaped length
+    expect(parsedLength(text)).toBeGreaterThan(4000);
+    expect(text.startsWith('⚠️ <b>Waiting for review</b>\nreason: ')).toBe(
+      true,
+    );
+    expect(text.endsWith('…\nUser: #UID42')).toBe(true);
+    // never cut inside an entity
+    expect(text).not.toMatch(/&(?!amp;|lt;|gt;)/);
+  });
+
+  it('budgets the plain fallback by the characters Telegram counts, not the escaped length', async () => {
+    fetchMock.mockImplementationOnce(() => refused(400));
+    // 1,000 "&" = 5,000 escaped characters but only 1,000 for Telegram: fits
+    const text = '&'.repeat(1000);
+    await new TelegramLoggerService().logAlert('S', text);
+    expect(call(1).body.text).toBe(`⚠️ <b>S</b>\n${'&amp;'.repeat(1000)}`);
+  });
+
+  it('caps each field value, so long fields still leave a plain fallback Telegram accepts', async () => {
+    fetchMock.mockImplementationOnce(() => refused(400));
+    await new TelegramLoggerService().logAlert('Settlement', 'refused', {
+      fields: [
+        ['Bot said', `${'<x>'.repeat(2000)}`],
+        ['Payment', 'P1', 'code'],
+      ],
+    });
+    const rich = call(0).body.rich_message?.html ?? '';
+    const plain = call(1).body.text ?? '';
+    expect(parsedLength(plain)).toBeLessThanOrEqual(4096);
+    expect(plain).toContain('refused');
+    expect(plain.endsWith('…\nPayment: <code>P1</code>')).toBe(true);
+    // 499 characters kept + the ellipsis, cut before escaping
+    expect(plain).toContain(`Bot said: ${'&lt;x&gt;'.repeat(166)}&lt;…`);
+    expect(rich).toContain(`${'&lt;x&gt;'.repeat(166)}&lt;…</td>`);
+  });
+
+  it('stops trying rich messages once the Bot API says it has no such method', async () => {
+    const service = new TelegramLoggerService();
+    fetchMock.mockImplementationOnce(() => refused(404));
+    await service.logAlert('S', 'one');
+    await service.logAlert('S', 'two');
+    expect([0, 1, 2].map((i) => call(i).method)).toEqual([
+      'sendRichMessage',
+      'sendMessage',
+      'sendMessage',
+    ]);
   });
 
   describe('topic', () => {
@@ -201,25 +323,75 @@ describe('TelegramLoggerService log group limits', () => {
 
     await jest.advanceTimersByTimeAsync(11_000);
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    const body = JSON.parse(
+    expect(
       (fetchMock.mock.calls[1] as [string, { body: string }])[1].body,
-    ) as { text: string };
-    expect(body.text).toContain('payout stuck');
+    ).toContain('payout stuck');
   });
 
   it("logs an alert Telegram refused for another reason (it's not retried)", async () => {
     const service = new TelegramLoggerService();
-    fetchMock.mockImplementationOnce(() =>
+    const badRequest = () =>
       Promise.resolve({
         ok: false,
         status: 400,
         json: () => Promise.resolve({ ok: false, description: 'Bad Request' }),
-      }),
-    );
+      });
+    // the rich message, then the plain fallback
+    fetchMock
+      .mockImplementationOnce(badRequest)
+      .mockImplementationOnce(badRequest);
     await service.logAlert('Settlement', 'payout stuck');
     expect(error).toHaveBeenCalledWith(
       'ALERT (Settlement) not sent to Telegram: payout stuck',
     );
+  });
+
+  it('a queued alert whose rich form was refused is retried as plain text only', async () => {
+    jest.useFakeTimers({ now: 1_000_000 });
+    const service = new TelegramLoggerService();
+    fetchMock
+      .mockImplementationOnce(() =>
+        Promise.resolve({
+          ok: false,
+          status: 400,
+          json: () => Promise.resolve({ ok: false, description: 'Bad HTML' }),
+        }),
+      ) // the rich form is refused
+      .mockImplementationOnce(() => tooMany(10)); // the plain fallback is limited
+    await service.logAlert('Settlement', 'payout stuck');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    await jest.advanceTimersByTimeAsync(11_000);
+    const methods = fetchMock.mock.calls.map(([url]) =>
+      String(url).split('/').pop(),
+    );
+    expect(methods).toEqual(['sendRichMessage', 'sendMessage', 'sendMessage']);
+  });
+
+  it('sends plain alerts for an hour after 3 rich refusals in a row', async () => {
+    jest.useFakeTimers({ now: 1_000_000 });
+    const service = new TelegramLoggerService();
+    const badHtml = () =>
+      Promise.resolve({
+        ok: false,
+        status: 400,
+        json: () => Promise.resolve({ ok: false, description: 'Bad HTML' }),
+      });
+    // rich refused, plain sent - three times
+    for (let i = 0; i < 3; i++) {
+      fetchMock.mockImplementationOnce(badHtml).mockImplementationOnce(ok);
+      await service.logAlert('S', `alert ${i}`);
+    }
+    const method = (i: number) =>
+      String((fetchMock.mock.calls[i] as [string])[0])
+        .split('/')
+        .pop();
+    await service.logAlert('S', 'during the pause');
+    expect(method(6)).toBe('sendMessage'); // no rich try
+
+    jest.setSystemTime(1_000_000 + 61 * 60_000);
+    await service.logAlert('S', 'after the pause');
+    expect(method(7)).toBe('sendRichMessage');
   });
 
   it('a 429 on a reaction delays a later alert instead of losing it', async () => {
@@ -269,14 +441,9 @@ describe('TelegramLoggerService log group limits', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
 
     await jest.advanceTimersByTimeAsync(1_000);
-    const texts = fetchMock.mock.calls.slice(1).map(
-      (c) =>
-        (
-          JSON.parse((c as [string, { body: string }])[1].body) as {
-            text: string;
-          }
-        ).text,
-    );
+    const texts = fetchMock.mock.calls
+      .slice(1)
+      .map((c) => (c as [string, { body: string }])[1].body);
     expect(texts).toHaveLength(2);
     expect(texts[0]).toContain('first');
     expect(texts[1]).toContain('second');

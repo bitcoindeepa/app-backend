@@ -1,5 +1,7 @@
-# Use Node.js 18 Alpine for smaller image size
-FROM node:18-alpine
+# Node 22 to match .nvmrc and package.json engines (>=22): @simplewebauthn/server
+# needs Node 22's WebCrypto globals (globalThis.SubtleCrypto); on 18 every
+# passkey request fails with "Cannot read properties of undefined (reading 'supports')"
+FROM node:22.12-alpine
 
 # Set working directory
 WORKDIR /app

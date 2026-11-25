@@ -457,6 +457,8 @@ describe('Auth, KYC, subscriptions and read endpoints (e2e)', () => {
         .set(auth())
         .expect(200);
       expect(latest.body.payhere_pay_id).toBe('P-2');
+      // a number whether package.amount is a float or a decimal column
+      expect(typeof latest.body.package_amount).toBe('number');
 
       const summary = await http()
         .get('/transaction/dca-summary')
