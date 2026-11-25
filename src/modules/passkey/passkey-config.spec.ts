@@ -1,4 +1,5 @@
 import { relyingParty } from './passkey-config';
+import { approvalKey } from './approval-action';
 import { isSessionLocked, UNLOCK_TTL_MS } from '../auth/session.service';
 
 describe('relyingParty', () => {
@@ -47,5 +48,54 @@ describe('isSessionLocked', () => {
     expect(
       isSessionLocked('web', true, new Date(now - UNLOCK_TTL_MS - 1), now),
     ).toBe(true);
+  });
+});
+
+describe('approvalKey', () => {
+  it('binds a send to its recipient, amount and payment key', () => {
+    const body = {
+      to_telegram_id: 100000002,
+      amount: 1000,
+      idempotency_key: 'k1',
+    };
+    expect(approvalKey('p2p_send', body)).toBe('p2p_send:100000002:1000:k1');
+    // Same send however the numbers are written
+    expect(
+      approvalKey('p2p_send', {
+        ...body,
+        to_telegram_id: '100000002',
+        amount: '01000',
+      }),
+    ).toBe('p2p_send:100000002:1000:k1');
+    expect(approvalKey('p2p_send', { ...body, amount: 1001 })).not.toBe(
+      approvalKey('p2p_send', body),
+    );
+  });
+
+  it('is null when a field is missing or malformed', () => {
+    expect(
+      approvalKey('p2p_send', { amount: 1000, idempotency_key: 'k' }),
+    ).toBeNull();
+    expect(
+      approvalKey('p2p_send', {
+        to_telegram_id: 1,
+        amount: -5,
+        idempotency_key: 'k',
+      }),
+    ).toBeNull();
+    expect(
+      approvalKey('p2p_send', {
+        to_telegram_id: 1,
+        amount: 1.5,
+        idempotency_key: 'k',
+      }),
+    ).toBeNull();
+    expect(approvalKey('sell_pay', {})).toBeNull();
+  });
+
+  it('binds a sale payment to its order', () => {
+    expect(approvalKey('sell_pay', { order_id: 'ABC-1' })).toBe(
+      'sell_pay:abc-1',
+    );
   });
 });

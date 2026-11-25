@@ -49,7 +49,8 @@ export const isSessionLocked = (
   hasPasskey &&
   (!unlockedAt || now - new Date(unlockedAt).getTime() > UNLOCK_TTL_MS);
 
-export type ChallengeKind = 'register' | 'unlock';
+/** register/unlock: settings and the lock; approve: one send or sale payment */
+export type ChallengeKind = 'register' | 'unlock' | 'approve';
 
 /** A pending WebAuthn challenge lives this long (the browser prompt's timeout) */
 export const CHALLENGE_TTL_MS = 5 * 60 * 1000;
@@ -206,42 +207,50 @@ export class SessionService {
     sessionId: string,
     kind: ChallengeKind,
     challenge: string,
+    action: string | null = null,
   ): Promise<void> {
     await this.knex('user_session')
       .where({ id: sessionId })
       .update({
         webauthn_challenge: challenge,
         webauthn_challenge_kind: kind,
+        webauthn_challenge_action: action,
         webauthn_challenge_expires_at: new Date(Date.now() + CHALLENGE_TTL_MS),
       });
   }
 
   /**
-   * Take the session's pending challenge of this kind, if it hasn't
-   * expired. Single use: it's cleared in the same statement, so a response
-   * can't be replayed and two requests can't both use it.
+   * Take the session's pending challenge of this kind (and the action it
+   * approves), if it hasn't expired. Single use: it's cleared in the same
+   * statement, so a response can't be replayed and two requests can't both
+   * use it.
    */
   async takeChallenge(
     sessionId: string,
     kind: ChallengeKind,
-  ): Promise<string | null> {
+  ): Promise<{ challenge: string; action: string | null } | null> {
     // RETURNING shows the new (null) value, so read the old one through a
     // locked subquery
-    const result = await this.knex.raw<{ rows: { challenge: string }[] }>(
+    const result = await this.knex.raw<{
+      rows: { challenge: string; action: string | null }[];
+    }>(
       `UPDATE user_session s
           SET webauthn_challenge = NULL,
               webauthn_challenge_kind = NULL,
+              webauthn_challenge_action = NULL,
               webauthn_challenge_expires_at = NULL
-         FROM (SELECT id, webauthn_challenge FROM user_session
+         FROM (SELECT id, webauthn_challenge, webauthn_challenge_action
+                 FROM user_session
                 WHERE id = ? FOR UPDATE) old
         WHERE s.id = old.id
           AND s.webauthn_challenge_kind = ?
           AND s.webauthn_challenge IS NOT NULL
           AND s.webauthn_challenge_expires_at > now()
-    RETURNING old.webauthn_challenge AS challenge`,
+    RETURNING old.webauthn_challenge AS challenge,
+              old.webauthn_challenge_action AS action`,
       [sessionId, kind],
     );
-    return result.rows[0]?.challenge ?? null;
+    return result.rows[0] ?? null;
   }
 
   async revoke(sessionId: string): Promise<void> {

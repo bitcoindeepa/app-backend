@@ -150,17 +150,17 @@ export class PasskeyService {
     const existing = await this.list(user.id);
     if (existing.length > 0) this.assertUnlocked(user);
 
-    const challenge = await this.sessions.takeChallenge(
+    const taken = await this.sessions.takeChallenge(
       user.sessionId!,
       'register',
     );
-    if (!challenge) throw this.challengeExpired();
+    if (!taken) throw this.challengeExpired();
 
     let verified: VerifiedRegistrationResponse;
     try {
       verified = await verifyRegistrationResponse({
         response,
-        expectedChallenge: challenge,
+        expectedChallenge: taken.challenge,
         expectedOrigin: rp.origins,
         expectedRPID: rp.id,
         requireUserVerification: true,
@@ -204,13 +204,88 @@ export class PasskeyService {
     return this.status({ ...user, locked: false });
   }
 
-  /** Options for navigator.credentials.get() */
+  /** Options for navigator.credentials.get(), to unlock the session */
   async unlockOptions(
     user: RequestUser,
   ): Promise<PublicKeyCredentialRequestOptionsJSON> {
+    return this.requestOptions(user, 'unlock');
+  }
+
+  /** Unlock this session with one of the member's passkeys */
+  async unlock(
+    user: RequestUser,
+    response: AuthenticationResponseJSON,
+  ): Promise<PasskeyStatus> {
+    const rp = this.webOnly(user);
+    const taken = await this.sessions.takeChallenge(user.sessionId!, 'unlock');
+    if (!taken) throw this.challengeExpired();
+    await this.verifyAssertion(user, rp, taken.challenge, response);
+    await this.sessions.markUnlocked(user.sessionId!);
+    return this.status({ ...user, locked: false });
+  }
+
+  /**
+   * Options for approving one send or sale payment. The challenge is stored
+   * with the action's key, so the approval only works for that action.
+   * A web member without a passkey gets 403 passkey_setup_required.
+   */
+  async approvalOptions(
+    user: RequestUser,
+    action: string,
+  ): Promise<PublicKeyCredentialRequestOptionsJSON> {
+    return this.requestOptions(user, 'approve', action);
+  }
+
+  /**
+   * Check an approval for `action` (PasskeyApprovalGuard). Single use: the
+   * challenge is taken whatever happens. A good approval also unlocks the
+   * session (the member just used their passkey).
+   */
+  async verifyApproval(
+    user: RequestUser,
+    action: string,
+    response: AuthenticationResponseJSON,
+  ): Promise<void> {
+    const rp = this.webOnly(user);
+    const taken = await this.sessions.takeChallenge(user.sessionId!, 'approve');
+    if (!taken) throw this.approvalRequired();
+    if (taken.action !== action) {
+      this.logger.warn(
+        `Passkey approval for another action refused for user ${user.id}`,
+      );
+      throw this.approvalRequired();
+    }
+    await this.verifyAssertion(user, rp, taken.challenge, response);
+    await this.sessions.markUnlocked(user.sessionId!);
+  }
+
+  /**
+   * Whether this session must approve sends and sale payments with a
+   * passkey: every web session, when the server has passkeys set up
+   * (APP_URL). The Mini App can't run passkeys, so it never does.
+   */
+  mustApprove(user: RequestUser): boolean {
+    return user.sessionKind === 'web' && relyingParty() !== null;
+  }
+
+  /** 403 passkey_setup_required when the member has no passkey */
+  async assertHasPasskey(user: RequestUser): Promise<void> {
+    const row = await this.knex('user_passkey')
+      .where({ user_id: user.id })
+      .first<{ id: string } | undefined>('id');
+    if (!row) throw this.setupRequired();
+  }
+
+  private async requestOptions(
+    user: RequestUser,
+    kind: 'unlock' | 'approve',
+    action: string | null = null,
+  ): Promise<PublicKeyCredentialRequestOptionsJSON> {
     const rp = this.webOnly(user);
     const rows = await this.list(user.id);
-    if (rows.length === 0) throw this.noPasskeys();
+    if (rows.length === 0) {
+      throw kind === 'approve' ? this.setupRequired() : this.noPasskeys();
+    }
     const options = await generateAuthenticationOptions({
       rpID: rp.id,
       allowCredentials: rows.map((row) => ({
@@ -221,24 +296,20 @@ export class PasskeyService {
     });
     await this.sessions.setChallenge(
       user.sessionId!,
-      'unlock',
+      kind,
       options.challenge,
+      action,
     );
     return options;
   }
 
-  /** Unlock this session with one of the member's passkeys */
-  async unlock(
+  /** Verify a WebAuthn assertion by one of the member's passkeys; bumps its counter */
+  private async verifyAssertion(
     user: RequestUser,
+    rp: RelyingParty,
+    challenge: string,
     response: AuthenticationResponseJSON,
-  ): Promise<PasskeyStatus> {
-    const rp = this.webOnly(user);
-    const challenge = await this.sessions.takeChallenge(
-      user.sessionId!,
-      'unlock',
-    );
-    if (!challenge) throw this.challengeExpired();
-
+  ): Promise<void> {
     const row = await this.knex('user_passkey')
       .where({ user_id: user.id, credential_id: String(response?.id ?? '') })
       .first<PasskeyRow | undefined>();
@@ -262,7 +333,7 @@ export class PasskeyService {
       });
     } catch (error) {
       this.logger.warn(
-        `Passkey unlock refused for user ${user.id}: ${errorMessage(error)}`,
+        `Passkey assertion refused for user ${user.id}: ${errorMessage(error)}`,
       );
       throw this.notVerified();
     }
@@ -272,8 +343,6 @@ export class PasskeyService {
       counter: verified.authenticationInfo.newCounter,
       last_used_at: new Date(),
     });
-    await this.sessions.markUnlocked(user.sessionId!);
-    return this.status({ ...user, locked: false });
   }
 
   /** Remove one (an unlocked web session only); the last one turns the lock off */
@@ -335,6 +404,20 @@ export class PasskeyService {
         message: 'Unlock with your passkey to continue.',
       });
     }
+  }
+
+  private setupRequired() {
+    return new ForbiddenException({
+      code: 'passkey_setup_required',
+      message: 'Set up a passkey to send or sell in the browser app.',
+    });
+  }
+
+  private approvalRequired() {
+    return new ForbiddenException({
+      code: 'passkey_approval_required',
+      message: 'Approve this with your passkey.',
+    });
   }
 
   private challengeExpired() {

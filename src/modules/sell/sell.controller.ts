@@ -17,7 +17,10 @@ import {
 import type { Request } from 'express';
 import { ConditionalAuthGuard } from '../auth/conditional-auth.guard';
 import { SessionRequiredGuard } from '../auth/session-required.guard';
-import { PasskeyUnlockedGuard } from '../auth/passkey-unlocked.guard';
+import {
+  PasskeyApprovalGuard,
+  RequirePasskeyApproval,
+} from '../passkey/passkey-approval.guard';
 import { KycVerifiedGuard } from '../auth/kyc-verified.guard';
 import { RequireKyc } from '../auth/require-kyc.decorator';
 import { CurrentUser } from '../auth/user.decorator';
@@ -92,8 +95,9 @@ export class SellController {
     P2pEnabledGuard,
     ConditionalAuthGuard,
     SessionRequiredGuard,
-    PasskeyUnlockedGuard,
+    PasskeyApprovalGuard,
   )
+  @RequirePasskeyApproval('sell_pay')
   @HttpCode(HttpStatus.OK)
   pay(
     @CurrentUser() user: JwtPayload,

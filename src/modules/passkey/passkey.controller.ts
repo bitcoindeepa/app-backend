@@ -5,6 +5,7 @@ import {
   Get,
   HttpCode,
   HttpStatus,
+  BadRequestException,
   NotFoundException,
   Param,
   ParseUUIDPipe,
@@ -19,7 +20,12 @@ import { SessionRequiredGuard } from '../auth/session-required.guard';
 import { AdminKeyGuard } from '../auth/admin-key.guard';
 import { CurrentUser } from '../auth/user.decorator';
 import { TelegramLoggerService } from '../telegram-logger/telegram-logger.service';
-import { RegisterPasskeyDto, UnlockDto } from './dto/passkey.dto';
+import {
+  ApprovalOptionsDto,
+  RegisterPasskeyDto,
+  UnlockDto,
+} from './dto/passkey.dto';
+import { approvalKey } from './approval-action';
 import { PasskeyService } from './passkey.service';
 
 type RequestUser = RequestWithUser['user'];
@@ -29,7 +35,8 @@ type RequestUser = RequestWithUser['user'];
  * passkey_unavailable (403 in the Mini App, 503 without APP_URL),
  * passkey_required (403: unlock first), challenge_expired (400: ask for new
  * options), passkey_not_verified (400), passkey_exists (400),
- * passkey_limit (400), passkey_not_set (404).
+ * passkey_limit (400), passkey_not_set (404), passkey_setup_required (403:
+ * a web member needs one to send or sell), passkey_approval_required (403).
  * Never 401 for a failed passkey: the app treats 401 as "signed out".
  * A legacy JWT can't use these (403 relogin_required).
  */
@@ -76,6 +83,28 @@ export class PasskeyController {
   @HttpCode(HttpStatus.OK)
   unlock(@CurrentUser() user: RequestUser, @Body() body: UnlockDto) {
     return this.passkeys.unlock(user, body.response);
+  }
+
+  /**
+   * Options to approve one send or sale payment (web). The approval goes
+   * with that request in X-Passkey-Assertion and works for it only.
+   */
+  @Post('approve/options')
+  @UseGuards(ConditionalAuthGuard, SessionRequiredGuard)
+  @HttpCode(HttpStatus.OK)
+  approvalOptions(
+    @CurrentUser() user: RequestUser,
+    @Body() body: ApprovalOptionsDto,
+  ) {
+    const action = approvalKey(body.action, body);
+    if (!action) {
+      throw new BadRequestException(
+        body.action === 'p2p_send'
+          ? 'to_telegram_id, amount and idempotency_key are required'
+          : 'order_id is required',
+      );
+    }
+    return this.passkeys.approvalOptions(user, action);
   }
 
   /** Remove one (needs an unlocked web session); removing the last turns the lock off */

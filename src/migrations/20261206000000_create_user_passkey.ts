@@ -9,7 +9,9 @@ import type { Knex } from 'knex';
 // user_session.unlocked_at: when this session last unlocked with a passkey.
 // A web session of a member with a passkey is locked until then (and again
 // once it's too old). webauthn_challenge*: the one pending WebAuthn
-// challenge of the session, single use, short-lived.
+// challenge of the session, single use, short-lived; for an approval
+// (a send or a sale payment) webauthn_challenge_action names the exact
+// action it approves.
 export async function up(knex: Knex): Promise<void> {
   await knex.schema.createTable('user_passkey', (table) => {
     table.uuid('id').primary().defaultTo(knex.raw('uuid_generate_v4()'));
@@ -38,6 +40,7 @@ export async function up(knex: Knex): Promise<void> {
     table.timestamp('unlocked_at', { useTz: true }).nullable();
     table.text('webauthn_challenge').nullable();
     table.string('webauthn_challenge_kind', 16).nullable();
+    table.text('webauthn_challenge_action').nullable();
     table
       .timestamp('webauthn_challenge_expires_at', { useTz: true })
       .nullable();
@@ -49,6 +52,7 @@ export async function down(knex: Knex): Promise<void> {
     table.dropColumn('unlocked_at');
     table.dropColumn('webauthn_challenge');
     table.dropColumn('webauthn_challenge_kind');
+    table.dropColumn('webauthn_challenge_action');
     table.dropColumn('webauthn_challenge_expires_at');
   });
   await knex.schema.dropTableIfExists('user_passkey');
