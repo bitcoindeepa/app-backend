@@ -19,6 +19,7 @@ import {
   type VerifiedAuthenticationResponse,
   type VerifiedRegistrationResponse,
 } from '@simplewebauthn/server';
+import type { Knex } from 'knex';
 import { KnexService } from '../knex/knex.service';
 import {
   CHALLENGE_TTL_MS,
@@ -346,15 +347,24 @@ export class PasskeyService {
       .first<PasskeyRow | undefined>();
     // Someone else's passkey, or one that was removed
     if (!row) throw this.notVerified();
-    await this.checkAssertion(row, rp, challenge, response);
+    await this.checkAssertion(row, rp, challenge, response, (trx) =>
+      this.sessions.markUnlocked(user.sessionId!, trx),
+    );
   }
 
-  /** Verify an assertion against a stored passkey; bumps its counter */
+  /**
+   * Verify an assertion against a stored passkey, then bump its counter and
+   * run `andThen` (e.g. unlock the session) in one transaction holding the
+   * owner's user row (the lock register() and remove() take), and only if
+   * the passkey still exists: one removed or replaced while the assertion
+   * was being checked is refused (400 passkey_not_verified)
+   */
   private async checkAssertion(
     row: PasskeyRow,
     rp: RelyingParty,
     challenge: string,
     response: AuthenticationResponseJSON,
+    andThen?: (trx: Knex.Transaction) => Promise<void>,
   ): Promise<void> {
     let verified: VerifiedAuthenticationResponse;
     try {
@@ -380,9 +390,9 @@ export class PasskeyService {
     if (!verified.verified) throw this.notVerified();
 
     await this.knex.transaction(async (trx) => {
-      await trx('user').where('id', user.id).forNoKeyUpdate().first('id');
+      await trx('user').where('id', row.user_id).forNoKeyUpdate().first('id');
       const updated = await trx('user_passkey')
-        .where({ id: row.id, user_id: user.id })
+        .where({ id: row.id, user_id: row.user_id })
         .update({
           // Two approvals verified side by side may finish out of order: keep
           // the highest counter (0 stays 0 for authenticators without one)
@@ -393,11 +403,11 @@ export class PasskeyService {
         });
       if (updated === 0) {
         this.logger.warn(
-          `Passkey assertion refused for user ${user.id}: the passkey was removed meanwhile`,
+          `Passkey assertion refused for user ${row.user_id}: the passkey was removed meanwhile`,
         );
         throw this.notVerified();
       }
-      await this.sessions.markUnlocked(user.sessionId!, trx);
+      await andThen?.(trx);
     });
   }
 

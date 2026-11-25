@@ -11,6 +11,7 @@ To release: add the version's section below, bump `version` in `package.json`, a
 ### New
 
 - **Passkeys for the web app** (Face ID, fingerprint or device PIN, `/passkey/*`). Every send (`POST /p2p/send`) and sale payment (`POST /sell/orders/:id/pay`) from the web needs a passkey approval for exactly that action, sent in `X-Passkey-Assertion`. A member can also lock the app: a locked web session can't add or remove bank accounts until it unlocks (12 h). Support can remove a member's passkeys with `POST /passkey/admin-reset/:userId`. The Mini App is never gated: Telegram's webview can't run passkeys for our domain (#153)
+- **Sign in with a passkey on the web**: `POST /auth/passkey/options` then `POST /auth/passkey/login` start a web session that is already unlocked, without Telegram (30/min per IP). It doesn't renew the bot wallet link, which lasts a year from the last Telegram login (#155)
 - **Savings pots**: the bot's balance now includes `pot_balance` and `pots`. Sell quotes only use spendable sats, and `dca-summary` returns `spendable_balance`, `pot_balance` and `pots`. A bot without these fields keeps the old behaviour (#149)
 - Admins get a Telegram alert when a member's KYC attempt is declined (#80)
 - Settlement handles each bot refusal by type: `APPROVAL_DELIVERY` and `BUSY` retry on a slower schedule, `OVER_LIMIT` and `NO_WALLET` stop for a human (#143)
@@ -34,7 +35,7 @@ To release: add the version's section below, bump `version` in `package.json`, a
 ### Fixed
 
 - **Possible double payout**: settlement no longer overwrites an unrecorded attempt's marker with `UNKNOWN`, either when PayHere hasn't confirmed the payment or when the payment was held or charged back during the attempt. That marker is what stops a blind resend while the bot history can't be read
-- A passkey removed or replaced while an unlock or approval was being checked can no longer leave that session unlocked
+- A passkey removed or replaced while an unlock, approval or passkey sign-in was being checked is refused, so it can no longer leave a session unlocked
 - Telegram's plain-text alert fallback counts characters as Telegram does, and long field values (such as a bot error message) are cut, so the fallback is no longer cut early or refused for being too long
 - `/transaction/latest` returns `package_amount` as a number whatever the column type
 
@@ -45,10 +46,11 @@ To release: add the version's section below, bump `version` in `package.json`, a
 ### Upgrading
 
 - **Production moves from Node 18 to Node 22** with this release (#154)
-- 3 migrations, applied on startup in production, all safe while 2.0.1 is still serving:
+- 4 migrations, applied on startup in production, all safe while 2.0.1 is still serving:
   - `20261205000000_package_amount_decimal`: now a no-op (kept because development databases already ran it)
   - `20261205000001_more_settlement_failure_reasons`: widens the `settlement_failure` CHECK, added `NOT VALID` so the table isn't scanned under lock (#143)
   - `20261206000000_create_user_passkey`: the `user_passkey` table and nullable passkey columns on `user_session` (#153)
+  - `20261207000000_create_passkey_login_attempt`: the `passkey_login_attempt` table for passkey sign-in (#155)
 - New optional env var `WEBAUTHN_RP_ID`: the domain passkeys are bound to (default `APP_URL`'s host). **Set it before the first passkey is registered**: changing it later orphans every passkey
 - Deploy the backend before the frontend: the app reads the new `dca-summary` fields and the passkey routes
 
