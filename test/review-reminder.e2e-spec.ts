@@ -127,6 +127,16 @@ describe('Reminder of what waits for a human (e2e)', () => {
     );
     expect(text).toContain(`B1: 1000.00 LKR, #UID${USER} - paid twice`);
     expect(text).toContain(`P9: 4,568 sats, #UID${USER}`);
+    // The rich version: a table per group, same rows
+    const rich = (
+      logAlert.mock.calls as [string, string, { richHtml: string }][]
+    ).find(([source]) => source === 'Waiting for review')![2].richHtml;
+    expect(rich).toContain('<h4>Held one-time buys (1)</h4>');
+    expect(rich).toContain('<table bordered striped compact>');
+    expect(rich).toContain(
+      `<tr><td>B1</td><td>1000.00</td><td>#UID${USER}</td><td>paid twice</td></tr>`,
+    );
+    expect(rich).toContain(`<td>P9</td><td>4,568</td>`);
 
     // Once per interval, however many instances run the cron
     await reminder.remind();

@@ -22,6 +22,17 @@ function resetDepositThrottle(): void {
 }
 let ctx: TestContext;
 
+/** Whether a Settlement alert said `phrase` in its heading or its text */
+function alerted(spy: jest.SpyInstance, phrase: string): boolean {
+  return (spy.mock.calls as [string, string, { title?: string }?][]).some(
+    ([source, text, details]) =>
+      source === 'Settlement' &&
+      `${details?.title ?? ''} ${text}`
+        .toLowerCase()
+        .includes(phrase.toLowerCase()),
+  );
+}
+
 describe('Settlement (e2e)', () => {
   let settlement: SettlementService;
   let orderId: string;
@@ -354,10 +365,7 @@ describe('Settlement (e2e)', () => {
         settlement_failure: 'UNKNOWN',
         retry_count: 5,
       });
-      expect(alert).toHaveBeenCalledWith(
-        'Settlement',
-        expect.stringContaining("doesn't know send pending-7"),
-      );
+      expect(alerted(alert, "doesn't know the approval")).toBe(true);
       alert.mockRestore();
     });
 
@@ -370,8 +378,8 @@ describe('Settlement (e2e)', () => {
       ctx.bitcoinDeepa.getSendStatus.mockResolvedValue(null); // unreadable
       await settlement.pollAwaitingApprovals();
       await settlement.pollAwaitingApprovals();
-      const overdue = alert.mock.calls.filter(([, text]) =>
-        String(text).includes('waited over 25h'),
+      const overdue = alert.mock.calls.filter(
+        ([, , details]) => details?.title === 'approval not final after 25h',
       );
       expect(overdue).toHaveLength(1);
       ctx.bitcoinDeepa.getSendStatus.mockResolvedValue(null);
@@ -385,8 +393,8 @@ describe('Settlement (e2e)', () => {
         settlement.pollAwaitingApprovals(),
         settlement.pollAwaitingApprovals(),
       ]);
-      const rejected = alert.mock.calls.filter(([, text]) =>
-        String(text).includes('was rejected'),
+      const rejected = alert.mock.calls.filter(
+        ([, , details]) => details?.title === 'approval was rejected',
       );
       expect(rejected).toHaveLength(1);
       ctx.bitcoinDeepa.getSendStatus.mockResolvedValue(null);
@@ -408,10 +416,7 @@ describe('Settlement (e2e)', () => {
           settlement_failure: 'APPROVAL_REJECTED',
           retry_count: 5,
         });
-        expect(alert).toHaveBeenCalledWith(
-          'Settlement',
-          expect.stringContaining(`was ${status}`),
-        );
+        expect(alerted(alert, `was ${status}`)).toBe(true);
         alert.mockRestore();
       },
     );
@@ -559,10 +564,7 @@ describe('Settlement (e2e)', () => {
     });
     await settlement.retryUnsettledTransactions();
     expect(await tx()).toMatchObject({ settlement_failure: 'AUTH' });
-    expect(alert).toHaveBeenCalledWith(
-      'Settlement',
-      expect.stringContaining('rejected our signed request'),
-    );
+    expect(alerted(alert, 'rejected our signed request')).toBe(true);
     alert.mockRestore();
   });
 
@@ -579,10 +581,7 @@ describe('Settlement (e2e)', () => {
 
     await settlement.retryUnsettledTransactions();
     expect(await tx()).toMatchObject({ settled: false, retry_count: 5 });
-    expect(alert).toHaveBeenCalledWith(
-      'Settlement',
-      expect.stringContaining('permanently failed after 5 attempts'),
-    );
+    expect(alerted(alert, 'failed after 5 attempts')).toBe(true);
 
     await ctx
       .knex('transaction')
@@ -590,6 +589,100 @@ describe('Settlement (e2e)', () => {
       .update({ last_retry_at: new Date(0) });
     await settlement.retryUnsettledTransactions();
     expect(ctx.bitcoinDeepa.transferFunds).toHaveBeenCalledTimes(1);
+    alert.mockRestore();
+  });
+
+  it('stops at once and alerts when retrying cannot help (over the bot limit)', async () => {
+    const alert = jest.spyOn(ctx.app.get(TelegramLoggerService), 'logAlert');
+    ctx.bitcoinDeepa.transferFunds.mockResolvedValueOnce({
+      success: false,
+      failure: 'OVER_LIMIT',
+      message: 'Amount cannot exceed 300,000 sats',
+    });
+
+    await settlement.retryUnsettledTransactions();
+    expect(await tx()).toMatchObject({
+      settled: false,
+      retry_count: 5,
+      settlement_failure: 'OVER_LIMIT',
+    });
+    expect(alerted(alert, "Retrying won't help")).toBe(true);
+
+    await ctx
+      .knex('transaction')
+      .where({ payhere_pay_id: 'P1' })
+      .update({ last_retry_at: new Date(0) });
+    await settlement.retryUnsettledTransactions();
+    expect(ctx.bitcoinDeepa.transferFunds).toHaveBeenCalledTimes(1);
+    alert.mockRestore();
+  });
+
+  it('retries a passing refusal (approval DM not delivered) on the slower schedule', async () => {
+    ctx.bitcoinDeepa.transferFunds.mockResolvedValueOnce({
+      success: false,
+      failure: 'APPROVAL_DELIVERY',
+      message: 'Could not deliver the approval request via Telegram.',
+    });
+    await settlement.retryUnsettledTransactions();
+    expect(await tx()).toMatchObject({
+      retry_count: 1,
+      settlement_failure: 'APPROVAL_DELIVERY',
+    });
+    const attemptedAgo = (minutes: number) =>
+      ctx
+        .knex('transaction')
+        .where({ payhere_pay_id: 'P1' })
+        .update({
+          last_retry_at: ctx.knex.raw(`now() - interval '${minutes} minutes'`),
+        });
+
+    // 2^1 = 2 minutes would be due, but this one waits 4^1 = 4
+    await attemptedAgo(3);
+    await settlement.retryUnsettledTransactions();
+    expect(ctx.bitcoinDeepa.transferFunds).toHaveBeenCalledTimes(1);
+
+    await attemptedAgo(5);
+    await settlement.retryUnsettledTransactions();
+    expect(ctx.bitcoinDeepa.transferFunds).toHaveBeenCalledTimes(2);
+  });
+
+  it('after BUSY (a send with this memo was still running) the next attempt checks the bot history first', async () => {
+    ctx.bitcoinDeepa.transferFunds.mockResolvedValueOnce({
+      success: false,
+      failure: 'BUSY',
+      message: "Transaction with memo 'x' is already processing",
+    });
+    await settlement.retryUnsettledTransactions();
+    expect(await tx()).toMatchObject({ settlement_failure: 'BUSY' });
+
+    await ctx
+      .knex('transaction')
+      .where({ payhere_pay_id: 'P1' })
+      .update({ last_retry_at: new Date(0) });
+    ctx.bitcoinDeepa.findSettlementTransfer.mockResolvedValueOnce(true);
+    await settlement.retryUnsettledTransactions();
+    expect(ctx.bitcoinDeepa.findSettlementTransfer).toHaveBeenCalled();
+    expect(ctx.bitcoinDeepa.transferFunds).toHaveBeenCalledTimes(1);
+    expect(await tx()).toMatchObject({ settled: true });
+  });
+
+  it('does not report a refusal as stopped when the payment was reset during the send', async () => {
+    const alert = jest.spyOn(ctx.app.get(TelegramLoggerService), 'logAlert');
+    ctx.bitcoinDeepa.transferFunds.mockImplementationOnce(async () => {
+      // a human resets it while the send is running
+      await ctx
+        .knex('transaction')
+        .where({ payhere_pay_id: 'P1' })
+        .update({ retry_count: 0, last_retry_at: null });
+      return {
+        success: false,
+        failure: 'OVER_LIMIT',
+        message: 'Amount cannot exceed 300,000 sats',
+      };
+    });
+    await settlement.retryUnsettledTransactions();
+    expect(await tx()).toMatchObject({ retry_count: 0 });
+    expect(alerted(alert, "Retrying won't help")).toBe(false);
     alert.mockRestore();
   });
 
@@ -659,8 +752,8 @@ describe('Settlement (e2e)', () => {
     await settlement.retryUnsettledTransactions();
     expect(ctx.bitcoinDeepa.transferFunds).toHaveBeenCalledTimes(1);
     const missing = () =>
-      alert.mock.calls.filter(([, text]) =>
-        String(text).includes('amount check is not running'),
+      alert.mock.calls.filter(
+        ([, , details]) => details?.title === 'PayHere amount missing',
       );
     expect(missing()).toHaveLength(1);
 
@@ -698,9 +791,8 @@ describe('Settlement (e2e)', () => {
     ]);
     await settlement.retryUnsettledTransactions();
     expect(ctx.bitcoinDeepa.transferFunds).not.toHaveBeenCalled();
-    expect(alert).toHaveBeenCalledWith(
-      'Settlement',
-      expect.stringContaining('Possibly a forged/replayed notification'),
+    expect(alerted(alert, 'Possibly a forged/replayed notification')).toBe(
+      true,
     );
     alert.mockRestore();
   });
@@ -844,10 +936,7 @@ describe('Settlement (e2e)', () => {
       await settlement.retryUnsettledTransactions();
       expect(ctx.bitcoinDeepa.transferFunds).not.toHaveBeenCalled();
       expect(await tx()).toMatchObject({ settled: true });
-      expect(alert).toHaveBeenCalledWith(
-        'Settlement',
-        expect.stringContaining('were already sent'),
-      );
+      expect(alerted(alert, 'were already sent')).toBe(true);
       alert.mockRestore();
     });
 
@@ -900,14 +989,8 @@ describe('Settlement (e2e)', () => {
         settled: false,
         settlement_failure: 'UNKNOWN',
       });
-      expect(alert).toHaveBeenCalledWith(
-        'Settlement',
-        expect.stringContaining('may or may not have gone out'),
-      );
-      expect(alert).not.toHaveBeenCalledWith(
-        'Settlement',
-        expect.stringContaining('Possibly a forged'),
-      );
+      expect(alerted(alert, 'may or may not have gone out')).toBe(true);
+      expect(alerted(alert, 'Possibly a forged')).toBe(false);
       alert.mockRestore();
     });
   });
@@ -939,9 +1022,8 @@ describe('Settlement (e2e)', () => {
       } as never),
     );
     await settlement.retryUnsettledTransactions();
-    expect(alert).toHaveBeenCalledWith(
-      'Settlement',
-      expect.stringContaining('PayHere rejected our credentials (HTTP 403)'),
+    expect(alerted(alert, 'PayHere rejected our credentials (HTTP 403)')).toBe(
+      true,
     );
     alert.mockRestore();
   });
@@ -967,10 +1049,7 @@ describe('Settlement (e2e)', () => {
     await failOnce();
     await failOnce();
     expect(alert).toHaveBeenCalledTimes(1);
-    expect(alert).toHaveBeenCalledWith(
-      'Settlement',
-      expect.stringContaining('Payouts are paused'),
-    );
+    expect(alerted(alert, 'Payouts are paused')).toBe(true);
     alert.mockRestore();
   });
 
@@ -1052,10 +1131,7 @@ describe('Settlement (e2e)', () => {
 
       expect(ctx.bitcoinDeepa.transferFunds).toHaveBeenCalledTimes(1);
       expect(await tx()).toMatchObject({ status: 'CHARGEBACK', settled: true });
-      expect(alert).toHaveBeenCalledWith(
-        'Settlement',
-        expect.stringContaining('sats were sent to user'),
-      );
+      expect(alerted(alert, 'sats were sent to the user')).toBe(true);
     });
 
     it.each([
@@ -1074,12 +1150,12 @@ describe('Settlement (e2e)', () => {
           settled: false,
           settlement_failure: 'UNKNOWN',
         });
-        expect(alert).toHaveBeenCalledWith(
-          'Settlement',
-          expect.stringContaining(
+        expect(
+          alerted(
+            alert,
             `a transfer with "(Ref: P1)" ${wording}. Check the bot`,
           ),
-        );
+        ).toBe(true);
       },
     );
   });
@@ -1094,12 +1170,7 @@ describe('Settlement (e2e)', () => {
     await settlement.retryUnsettledTransactions();
     // The sats went out: the record says so, and a human is told
     expect(await tx()).toMatchObject({ status: 'CHARGEBACK', settled: true });
-    expect(alert).toHaveBeenCalledWith(
-      'Settlement',
-      expect.stringContaining(
-        `arrived while it was being settled: ${sats(980)} sats were sent`,
-      ),
-    );
+    expect(alerted(alert, 'chargeback after the sats were sent')).toBe(true);
     alert.mockRestore();
   });
 

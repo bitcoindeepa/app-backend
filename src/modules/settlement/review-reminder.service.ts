@@ -3,10 +3,15 @@ import { Cron } from '@nestjs/schedule';
 import type { Knex } from 'knex';
 import { KnexService } from '../knex/knex.service';
 import { RedisService } from '../redis/redis.service';
-import { TelegramLoggerService } from '../telegram-logger/telegram-logger.service';
+import {
+  TelegramLoggerService,
+  truncateText,
+} from '../telegram-logger/telegram-logger.service';
 import { errorMessage } from '../../common/error-message';
+import { escapeHtml } from '../../common/escape-html';
 import { SellStatus } from '../sell/sell.constants';
 import { MAX_SETTLEMENT_ATTEMPTS } from '../transaction/transaction.service';
+import { describeFailure } from './settlement-failure';
 
 /** How often the reminder goes out while anything is waiting */
 export const REMINDER_INTERVAL_HOURS = 3;
@@ -21,11 +26,56 @@ const MIN_AGE_MINUTES = 30;
 const BUY_MAX_AGE_DAYS = 7;
 /** Rows listed per group (Telegram messages are capped at 4096 characters) */
 const LISTED_PER_GROUP = 8;
+/**
+ * Reasons are unbounded text (upstream error messages): cut them so every
+ * group still fits. 3 groups x 8 lines with a 60-character reason stay well
+ * under Telegram's 4096 characters in the plain fallback (logAlert also cuts
+ * the whole text to fit, but that would drop the last groups); the rich
+ * table has room for more
+ */
+const PLAIN_REASON_CHARS = 60;
+const RICH_REASON_CHARS = 200;
+const plainReason = (reason: string | null) =>
+  reason ? ` - ${truncateText(reason, PLAIN_REASON_CHARS)}` : '';
+const richReason = (reason: string | null) =>
+  truncateText(reason ?? '', RICH_REASON_CHARS);
 
 interface Group {
-  title: string;
+  /** Short name, the rich message's section heading */
+  heading: string;
+  /** What to do about it */
+  hint: string;
   total: number;
+  /** One per listed row, for the plain text */
   lines: string[];
+  /** The same rows as table cells, for the rich message */
+  columns: string[];
+  rows: string[][];
+}
+
+const cell = (tag: 'th' | 'td', value: string) =>
+  `<${tag}>${escapeHtml(value)}</${tag}>`;
+
+/** The reminder as a rich message: per group a heading, the hint and a table */
+function richReminder(total: number, groups: Group[]): string {
+  return [
+    `<p><b>${total} item(s)</b> still waiting for a human.</p>`,
+    ...groups.map((group) => {
+      const more = group.total - group.rows.length;
+      return [
+        `<h4>${escapeHtml(group.heading)} (${group.total})</h4>`,
+        `<p>${escapeHtml(group.hint)}</p>`,
+        '<table bordered striped compact>',
+        `<tr>${group.columns.map((c) => cell('th', c)).join('')}</tr>`,
+        ...group.rows.map(
+          (row) => `<tr>${row.map((v) => cell('td', v)).join('')}</tr>`,
+        ),
+        '</table>',
+        ...(more > 0 ? [`<p>and ${more} more</p>`] : []),
+      ].join('');
+    }),
+    `<footer>Repeated every ${REMINDER_INTERVAL_HOURS}h while anything waits</footer>`,
+  ].join('');
 }
 
 const num = (value: string | number) => Number(value).toLocaleString('en-US');
@@ -76,13 +126,16 @@ export class ReviewReminderService {
         ...groups.map((group) => {
           const more = group.total - group.lines.length;
           return [
-            `\n${group.title} (${group.total}):`,
+            `\n${group.heading} (${group.hint}) (${group.total}):`,
             ...group.lines.map((line) => `- ${line}`),
             ...(more > 0 ? [`- and ${more} more`] : []),
           ].join('\n');
         }),
       ].join('\n');
-      await this.telegramLogger.logAlert('Waiting for review', text);
+      await this.telegramLogger.logAlert('Waiting for review', text, {
+        level: 'reminder',
+        richHtml: richReminder(total, groups),
+      });
     } catch (error) {
       this.logger.error(`Review reminder failed: ${errorMessage(error)}`);
     }
@@ -109,13 +162,22 @@ export class ReviewReminderService {
       .orderBy('updated_at')
       .limit(LISTED_PER_GROUP);
     return {
-      title: 'Sales in NEEDS_REVIEW (sats collected, check before refunding)',
+      heading: 'Sales in NEEDS_REVIEW',
+      hint: 'sats collected, check before refunding',
       total: await this.count(query()),
       lines: rows.map(
         (row) =>
           `${row.id}: ${num(row.sats)} sats for ${row.amount_lkr} LKR, #UID${row.user_id}` +
-          (row.failure_reason ? ` - ${row.failure_reason}` : ''),
+          plainReason(row.failure_reason),
       ),
+      columns: ['Order', 'Sats', 'LKR', 'User', 'Reason'],
+      rows: rows.map((row) => [
+        row.id,
+        num(row.sats),
+        row.amount_lkr,
+        `#UID${row.user_id}`,
+        richReason(row.failure_reason),
+      ]),
     };
   }
 
@@ -139,13 +201,21 @@ export class ReviewReminderService {
       .orderBy('created_at')
       .limit(LISTED_PER_GROUP);
     return {
-      title:
-        'Held one-time buys (POST /transaction/release-hold/<id>, or refund in PayHere)',
+      heading: 'Held one-time buys',
+      hint: 'POST /transaction/release-hold/<id>, or refund in PayHere',
       total: await this.count(query()),
       lines: rows.map(
         (row) =>
-          `${row.payhere_pay_id}: ${row.gross_amount ?? '?'} LKR, #UID${row.user_id ?? '?'} - ${row.hold_reason}`,
+          `${row.payhere_pay_id}: ${row.gross_amount ?? '?'} LKR, #UID${row.user_id ?? '?'}` +
+          plainReason(row.hold_reason),
       ),
+      columns: ['Payment', 'LKR', 'User', 'Reason'],
+      rows: rows.map((row) => [
+        row.payhere_pay_id,
+        row.gross_amount ?? '?',
+        `#UID${row.user_id ?? '?'}`,
+        richReason(row.hold_reason),
+      ]),
     };
   }
 
@@ -177,13 +247,30 @@ export class ReviewReminderService {
       .orderBy('last_retry_at')
       .limit(LISTED_PER_GROUP);
     return {
-      title: `Paid but not settled after ${MAX_SETTLEMENT_ATTEMPTS} attempts (check PayHere and BitcoinDeepa before POST /transaction/reset-retry-count/<id>)`,
+      // Refusals retrying can't fix stop after one attempt: the Reason says why
+      heading: 'Paid but not settled (retries stopped)',
+      hint: 'check PayHere and BitcoinDeepa before POST /transaction/reset-retry-count/<id>',
       total: await this.count(query()),
       lines: rows.map(
         (row) =>
           `${row.payhere_pay_id}: ${num(row.satoshis_purchased)} sats, #UID${row.user_id ?? '?'}` +
-          (row.settlement_failure ? ` - ${row.settlement_failure}` : ''),
+          plainReason(
+            row.settlement_failure
+              ? describeFailure(row.settlement_failure)
+              : null,
+          ),
       ),
+      columns: ['Payment', 'Sats', 'User', 'Reason'],
+      rows: rows.map((row) => [
+        row.payhere_pay_id,
+        num(row.satoshis_purchased),
+        `#UID${row.user_id ?? '?'}`,
+        richReason(
+          row.settlement_failure
+            ? describeFailure(row.settlement_failure)
+            : null,
+        ),
+      ]),
     };
   }
 

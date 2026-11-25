@@ -13,11 +13,24 @@ import {
 /**
  * Why a send didn't go through. Settlement uses it to decide what to do next:
  * - LOW_BALANCE: the DCA wallet lacked funds (retried when the bot reports a deposit)
- * - REJECTED: the bot refused it, nothing was sent (bad recipient, limits, ...)
+ * - APPROVAL_DELIVERY: above the approval threshold, but the bot couldn't DM
+ *   the approval request; nothing was sent (retried, slower)
+ * - BUSY: the bot is still processing a send with this memo (retried, slower)
+ * - OVER_LIMIT: above the bot's per-transfer max for the wallet (needs a human)
+ * - NO_WALLET: the bot doesn't know the recipient's (or our) wallet (needs a human)
+ * - REJECTED: any other refusal, nothing was sent
  * - AUTH: signing, timestamp, nonce or IP problem (401/403) - a config issue
  * - UNKNOWN: no answer or a 5xx - it may have gone through; retry with the SAME memo
  */
-export type TransferFailure = 'LOW_BALANCE' | 'REJECTED' | 'AUTH' | 'UNKNOWN';
+export type TransferFailure =
+  | 'LOW_BALANCE'
+  | 'APPROVAL_DELIVERY'
+  | 'BUSY'
+  | 'OVER_LIMIT'
+  | 'NO_WALLET'
+  | 'REJECTED'
+  | 'AUTH'
+  | 'UNKNOWN';
 
 export interface FundTransferRequest {
   amount: number; // satoshis
@@ -143,9 +156,18 @@ export interface SendStatusResponse {
   payment_hash?: string;
 }
 
-// The bot's 400 message for a sending wallet without enough sats
-const LOW_BALANCE_PATTERN =
-  /insufficient|low balance|not enough|balance too low/i;
+// The bot's 400 messages (it has no error codes yet), most specific first.
+// Only the "already processing" one quotes our memo, and ours never contain
+// these phrases.
+const REFUSAL_PATTERNS: [RegExp, TransferFailure][] = [
+  [/could not deliver the approval request/i, 'APPROVAL_DELIVERY'],
+  [/is already processing/i, 'BUSY'],
+  // Only the per-transfer max: other "... cannot exceed" refusals (the memo
+  // length, any limit that clears with time) stay REJECTED and are retried
+  [/^amount cannot exceed/i, 'OVER_LIMIT'],
+  [/not found or has no wallet/i, 'NO_WALLET'],
+  [/insufficient|low balance|not enough|balance too low/i, 'LOW_BALANCE'],
+];
 const APPROVAL_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
 const MAX_HISTORY_PAGE = 250; // the bot's max `limit` for /usertransactions
 const MEMO_LOOKUP_PAGES = 4;
@@ -270,7 +292,9 @@ export class BitcoinDeepaService {
     return {
       success: false,
       message,
-      failure: LOW_BALANCE_PATTERN.test(message) ? 'LOW_BALANCE' : 'REJECTED',
+      failure:
+        REFUSAL_PATTERNS.find(([pattern]) => pattern.test(message))?.[1] ??
+        'REJECTED',
     };
   }
 
