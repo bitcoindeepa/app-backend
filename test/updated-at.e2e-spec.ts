@@ -83,22 +83,33 @@ describe('updated_at trigger (e2e)', () => {
     expect(after.getTime()).toBeGreaterThan(LONG_AGO.getTime());
   });
 
-  it('is on every table that has updated_at except sell_order and the Better Auth tables', async () => {
-    const { rows } = await ctx.knex.raw<{
-      rows: { table_name: string }[];
-    }>(
+  it('is on every table that has updated_at except sell_order, log and the Better Auth tables', async () => {
+    // Derived from the schema, so a new table with timestamps(true, true)
+    // and no trigger fails here (see CLAUDE.md for how to attach it)
+    const expected = await ctx.knex.raw<{ rows: { table_name: string }[] }>(
+      `SELECT c.table_name FROM information_schema.columns c
+         JOIN information_schema.tables t
+           ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+        WHERE c.table_schema = 'public' AND c.column_name = 'updated_at'
+          AND t.table_type = 'BASE TABLE' -- not views (user_public...)
+          AND c.table_name NOT IN ('sell_order', 'log')
+          AND c.table_name NOT LIKE 'admin\\_%'
+        ORDER BY 1`,
+    );
+    const triggered = await ctx.knex.raw<{ rows: { table_name: string }[] }>(
       `SELECT c.relname AS table_name
          FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
         WHERE t.tgname LIKE '%_set_updated_at' AND NOT t.tgisinternal
         ORDER BY 1`,
     );
-    expect(rows.map((r) => r.table_name)).toEqual([
-      'buy_order',
-      'package',
-      'subscription',
-      'transaction',
-      'user',
-      'user_bank_account',
-    ]);
+    const names = (r: { rows: { table_name: string }[] }) =>
+      r.rows.map((row) => row.table_name).sort();
+
+    expect(names(triggered)).toEqual(names(expected));
+    // The query above isn't vacuous, and sell_order really is left out
+    expect(names(triggered)).toEqual(
+      expect.arrayContaining(['transaction', 'user', 'subscription']),
+    );
+    expect(names(triggered)).not.toContain('sell_order');
   });
 });
