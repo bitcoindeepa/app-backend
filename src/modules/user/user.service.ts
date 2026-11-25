@@ -5,9 +5,13 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { usernameUnavailableReason } from './username';
+import { ConfigService } from '@nestjs/config';
 import { KnexService } from '../knex/knex.service';
 import { TelegramLoggerService } from '../telegram-logger/telegram-logger.service';
+import { LarkService } from '../lark/lark.service';
 import { kycIssuesFrom } from '../didit/kyc-issues.util';
+import { verifiedNameFrom } from '../didit/verified-name.util';
+import { diditSessionConsoleUrl } from '../didit/console-url.util';
 import { errorMessage } from '../../common/error-message';
 import {
   DiditStatusMapping,
@@ -106,6 +110,8 @@ export class UserService {
   constructor(
     private readonly knexService: KnexService,
     private readonly telegramLogger: TelegramLoggerService,
+    private readonly larkService: LarkService,
+    private readonly configService: ConfigService,
   ) {}
 
   async upsertTelegramUser(profile: TelegramProfile): Promise<void> {
@@ -267,7 +273,7 @@ export class UserService {
       failure_reason?: string | null;
       /** Name read from the ID; kept on approval, cleared otherwise */
       verifiedName?: string | null;
-      /** For the admin alert on a declined verification */
+      /** For the admin alerts (declined, in review) */
       session_id?: string;
       decision?: Record<string, unknown>;
     },
@@ -323,7 +329,60 @@ export class UserService {
     ) {
       await this.alertKycDeclined(userId, rejectionReason, didit);
     }
+    // Once per move into review: Didit repeats the status on later updates
+    // of the same session; a session that leaves review and comes back
+    // (e.g. after a resubmission) notifies again
+    if (
+      dbStatus === KycStatus.IN_REVIEW &&
+      currentStatus !== KycStatus.IN_REVIEW
+    ) {
+      await this.notifyKycInReview(userId, didit);
+    }
     return dbStatus;
+  }
+
+  /**
+   * Tell the Lark KYC group that a session needs a manual decision, with a
+   * link to it in the Didit console (best effort, never throws).
+   */
+  private async notifyKycInReview(
+    userId: string,
+    didit: { session_id?: string; decision?: Record<string, unknown> },
+  ): Promise<void> {
+    try {
+      const user = await this.getUserById(userId);
+      const diditUrl = diditSessionConsoleUrl(
+        this.configService.get<string>('DIDIT_CONSOLE_PATH'),
+        didit.session_id,
+      );
+      const sent = await this.larkService.sendKycInReview({
+        subject: 'Bitcoin Deepa member',
+        fields: [
+          // kyc_full_name is only stored on approval; until then the name is
+          // what Didit read off the ID, carried in the webhook's decision
+          { label: 'Name (from ID)', value: verifiedNameFrom(didit.decision) },
+          { label: 'User ID', value: userId },
+          { label: 'Username', value: user?.username && `@${user.username}` },
+          {
+            label: 'Telegram',
+            value: user?.tg_username && `@${user.tg_username}`,
+          },
+          { label: 'Email', value: user?.email },
+          // Without a console link, the reviewer can still search the session
+          { label: 'Didit session', value: diditUrl ? null : didit.session_id },
+        ],
+        diditUrl,
+      });
+      if (sent) {
+        this.logger.log(
+          `Sent Lark In Review notification for user ${userId} (session ${didit.session_id ?? 'unknown'})`,
+        );
+      }
+    } catch (error) {
+      this.logger.error(
+        `Lark In Review notification for user ${userId} failed: ${errorMessage(error)}`,
+      );
+    }
   }
 
   /** Tell the admins a KYC attempt failed, and why (best effort, never throws). */

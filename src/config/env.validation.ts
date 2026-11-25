@@ -234,6 +234,22 @@ class EnvironmentVariables {
   @IsNotEmpty()
   DIDIT_WEBHOOK_SECRET?: string;
 
+  // Didit console page (https://<host>/console/<org>/<app>/...): links Lark
+  // KYC-in-review messages to the session
+  @IsOptional()
+  @IsString()
+  DIDIT_CONSOLE_PATH?: string;
+
+  // Lark KYC group (custom bot webhook): a message per session that needs a
+  // manual decision. Unset = no message
+  @IsOptional()
+  @IsString()
+  LARK_KYC_WEBHOOK_URL?: string;
+
+  @IsOptional()
+  @IsString()
+  LARK_KYC_WEBHOOK_SECRET?: string;
+
   // Bitcoin / fees
   @IsOptional()
   @IsIn(['true', 'false'])

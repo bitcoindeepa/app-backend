@@ -74,6 +74,7 @@ This is a NestJS-based backend service for the BitcoinDeepa DCA (Dollar Cost Ave
    - Automatic user KYC status updates via webhooks: `X-Signature` (HMAC of raw body), `X-Timestamp` must be within 5 minutes; `DIDIT_WEBHOOK_SECRET` required in production
    - Sessions API v3 (`/v3/session/`); late `Not Started`/`In Progress` webhooks never overwrite a final KYC result; `Resubmitted` → `IN_PROGRESS`
    - A `Declined` result posts a Telegram alert (`logAlert('KYC', ...)`) with the reason, each check's warnings from the webhook `decision` (`kyc-issues.util.ts`) and the Didit session id; once per decline (not when the user was already `DECLINED`), best effort (never fails the webhook)
+   - An `In Review` result posts a card to the Lark KYC group (`src/modules/lark/`, custom bot webhook `LARK_KYC_WEBHOOK_URL`, signed with `LARK_KYC_WEBHOOK_SECRET` when set; same card as CeyPay's): name from the ID, user id, usernames, email and an "Open in Didit" button (`DIDIT_CONSOLE_PATH`, else the session id). Once per move into review (not when the user was already `IN_REVIEW`), best effort (5 s timeout, never fails the webhook); unset URL = skipped
    - Uses strongly typed KYC status enum for database consistency
 
 10. **Admin Module** (`src/modules/admin/`) - everything behind the admin dashboard. `AdminModule` bundles one Nest module per area: `auth/`, `analytics/`, `transactions/`, `members/`. List endpoints share `common/pagination.ts` (`PaginationQueryDto`, `@SearchQuery()`, `toPage`, `likeEscape`). Add new admin areas as sibling folders and import them in `admin.module.ts`
@@ -237,6 +238,9 @@ DIDIT_API_KEY=your_didit_api_key  # Required for KYC verification
 DIDIT_BASE_URL=https://verification.didit.me  # Didit API base URL (v3 sessions API)
 DIDIT_WEBHOOK_SECRET=your_webhook_secret  # Required in production; optional in dev
 DIDIT_CALLBACK_BASE_URL=https://your-app-domain.com  # Your application base URL for webhook callbacks
+DIDIT_CONSOLE_PATH=https://business.didit.me/console/<org>/<app>/users  # Optional: session links in Lark messages
+LARK_KYC_WEBHOOK_URL=  # Optional: Lark KYC group custom bot; a card when a session goes In Review
+LARK_KYC_WEBHOOK_SECRET=  # Optional: the bot's signing secret, if signature verification is on
 
 # One-time buys (optional; defaults shown)
 BUY_MIN_LKR=100
