@@ -1751,9 +1751,12 @@ export class TransactionService {
     const cached = await this.redisService.get<DcaSummary>(key);
     if (cached) return cached;
     const summary = await this.computeDcaSummary(user_id);
-    // A missing wallet balance is retried soon instead of sticking for 5 min
+    // Short on purpose: the wallet balance and savings pots change in the bot
+    // (deposits, pot moves) without telling us, so a refresh should show them
+    // within seconds. This only absorbs bursts of requests (one bot call per
+    // member per 10 s); a payment, sale or send also clears it at once.
     await this.redisService.set(key, summary, {
-      ttl: summary.balance_available ? 300 : 30,
+      ttl: DCA_SUMMARY_TTL_SECONDS,
     });
     return summary;
   }
@@ -1877,6 +1880,9 @@ export class TransactionService {
     );
   }
 }
+
+/** How long a member's dca-summary (wallet balance included) is cached */
+export const DCA_SUMMARY_TTL_SECONDS = 10;
 
 /** Sell statuses whose sats may have left the user's wallet (not refunded) */
 const SALE_PAID_STATUSES: SellStatus[] = [

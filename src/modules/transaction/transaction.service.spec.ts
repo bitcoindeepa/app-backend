@@ -1,5 +1,6 @@
 import { createHash } from 'crypto';
 import {
+  DCA_SUMMARY_TTL_SECONDS,
   isPurchaseSettlement,
   matchSalePayments,
   parseAmount,
@@ -323,5 +324,47 @@ describe('TransactionService wallet balance (dca-summary)', () => {
       pot_balance: 0,
       pots: [],
     });
+  });
+});
+
+describe('TransactionService dca-summary cache', () => {
+  it('caches the summary for 10 seconds, also without a balance', async () => {
+    for (const success of [true, false]) {
+      const redis = {
+        get: jest.fn().mockResolvedValue(null),
+        set: jest.fn().mockResolvedValue(undefined),
+      };
+      // knex('transaction').where().whereNotNull().where() → no purchases
+      const knex = jest.fn(() => ({
+        where: () => ({
+          whereNotNull: () => ({ where: () => Promise.resolve([]) }),
+        }),
+      }));
+      const service = new TransactionService(
+        { knex } as never,
+        {
+          getBtcLkrRate: jest.fn().mockResolvedValue(null),
+          getBitcoin24HrChange: jest.fn().mockResolvedValue(null),
+        } as never,
+        redis as never,
+        {} as never,
+        {
+          isConfigured: () => true,
+          getUserBalance: jest
+            .fn()
+            .mockResolvedValue(
+              success ? { success, balance: 1 } : { success, message: 'x' },
+            ),
+        } as never,
+        {} as never,
+      );
+      await service.getDCASummaryForUser('42');
+      expect(redis.set).toHaveBeenCalledWith(
+        expect.stringContaining('42'),
+        expect.objectContaining({ balance_available: success }),
+        { ttl: DCA_SUMMARY_TTL_SECONDS },
+      );
+    }
+    expect(DCA_SUMMARY_TTL_SECONDS).toBe(10);
   });
 });
