@@ -15,7 +15,12 @@ import { errorMessage } from '../../common/error-message';
 
 export interface RequestWithUser extends Request {
   /** sessionKind 'legacy' = a pre-session 7-day JWT (SessionRequiredGuard) */
-  user: JwtPayload & { sessionId?: string; sessionKind?: string };
+  user: JwtPayload & {
+    sessionId?: string;
+    sessionKind?: string;
+    /** Set for real sessions only (see SessionUser.locked) */
+    locked?: boolean;
+  };
 }
 
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);

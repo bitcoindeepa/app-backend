@@ -118,6 +118,13 @@ class EnvironmentVariables {
   @IsUrl({ require_tld: false, require_protocol: true })
   APP_URL?: string;
 
+  // Domain passkeys are bound to (WebAuthn RP ID). Defaults to APP_URL's
+  // host; set it to the parent domain (bitcoindeepa.com) so every subdomain
+  // shares them. Changing it later orphans every registered passkey.
+  @IsOptional()
+  @Matches(/^(?=.{1,253}$)[a-z0-9-]+(\.[a-z0-9-]+)*$/i)
+  WEBAUTHN_RP_ID?: string;
+
   // User-app session cookie across sites, for dev/staging only (a vercel.app
   // app with a railway.app API): 'none' = SameSite=None; Secure. Production
   // shares one site (app./api.bitcoindeepa.com) and stays 'lax'.

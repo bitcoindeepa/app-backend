@@ -1,0 +1,51 @@
+import { relyingParty } from './passkey-config';
+import { isSessionLocked, UNLOCK_TTL_MS } from '../auth/session.service';
+
+describe('relyingParty', () => {
+  afterEach(() => {
+    delete process.env.APP_URL;
+    delete process.env.WEBAUTHN_RP_ID;
+  });
+
+  it("defaults the RP ID to APP_URL's host and accepts every APP_URL origin", () => {
+    process.env.APP_URL =
+      'https://app.bitcoindeepa.com/, https://beta.bitcoindeepa.com';
+    expect(relyingParty()).toEqual({
+      id: 'app.bitcoindeepa.com',
+      name: 'Bitcoin Deepa',
+      origins: [
+        'https://app.bitcoindeepa.com',
+        'https://beta.bitcoindeepa.com',
+      ],
+    });
+  });
+
+  it('uses WEBAUTHN_RP_ID when set', () => {
+    process.env.APP_URL = 'https://app.bitcoindeepa.com';
+    process.env.WEBAUTHN_RP_ID = 'bitcoindeepa.com';
+    expect(relyingParty()?.id).toBe('bitcoindeepa.com');
+  });
+
+  it('is null without APP_URL', () => {
+    expect(relyingParty()).toBeNull();
+  });
+});
+
+describe('isSessionLocked', () => {
+  const now = Date.parse('2026-11-25T12:00:00Z');
+
+  it('never locks without a passkey, nor the Mini App', () => {
+    expect(isSessionLocked('web', false, null, now)).toBe(false);
+    expect(isSessionLocked('miniapp', true, null, now)).toBe(false);
+  });
+
+  it('locks a web session until it unlocks, and again once that is too old', () => {
+    expect(isSessionLocked('web', true, null, now)).toBe(true);
+    expect(isSessionLocked('web', true, new Date(now - 60_000), now)).toBe(
+      false,
+    );
+    expect(
+      isSessionLocked('web', true, new Date(now - UNLOCK_TTL_MS - 1), now),
+    ).toBe(true);
+  });
+});

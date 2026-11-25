@@ -12,6 +12,7 @@ import {
 import type { Response } from 'express';
 import { ConditionalAuthGuard } from '../auth/conditional-auth.guard';
 import { SessionRequiredGuard } from '../auth/session-required.guard';
+import { PasskeyUnlockedGuard } from '../auth/passkey-unlocked.guard';
 import { CurrentUser } from '../auth/user.decorator';
 import { JwtPayload } from '../auth/auth.service';
 import { P2pEnabledGuard } from '../../common/p2p-enabled';
@@ -51,6 +52,7 @@ export class P2pController {
 
   /** 200 when final (completed/failed), 202 while it's still going */
   @Post('send')
+  @UseGuards(PasskeyUnlockedGuard)
   async send(
     @CurrentUser() user: JwtPayload,
     @Body() dto: P2pSendDto,
