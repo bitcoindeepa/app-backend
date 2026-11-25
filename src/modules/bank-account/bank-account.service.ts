@@ -426,10 +426,15 @@ export class BankAccountService {
       if (!ceypayUserId) {
         // Idempotent on our user id, so a retry gets the same CeyPay user
         ceypayUserId = (await this.ceyPayService.upsertUser(user.id)).userId;
-        await this.knex('user')
-          .where('id', user.id)
-          .whereNull('ceypay_user_id')
-          .update({ ceypay_user_id: ceypayUserId });
+        // Bounded, so a wait on the member's row can't outlast the claim (the
+        // only DB write between the claim and the CeyPay calls)
+        await this.knex.transaction(async (trx) => {
+          await trx.raw("SET LOCAL lock_timeout = '5s'");
+          await trx('user')
+            .where('id', user.id)
+            .whereNull('ceypay_user_id')
+            .update({ ceypay_user_id: ceypayUserId });
+        });
       }
       const known = (
         await this.ceyPayService.listBankAccounts(ceypayUserId)
@@ -588,8 +593,14 @@ export class BankAccountService {
       const [claimed] = await trx<BankAccountRow>('user_bank_account')
         .where('id', id)
         .where(withoutLiveClaim(approvalClaimSeconds()))
-        // Milliseconds, so the JS Date read back matches it exactly in step 3
-        .update({ approving_at: trx.raw("date_trunc('milliseconds', now())") })
+        // clock_timestamp(), not now() (the transaction's start): a wait for
+        // the row lock above mustn't use up the claim. Milliseconds, so the
+        // JS Date read back matches it exactly in step 3
+        .update({
+          approving_at: trx.raw(
+            "date_trunc('milliseconds', clock_timestamp())",
+          ),
+        })
         .returning('*');
       if (!claimed) throw beingApproved();
       return { account: claimed, user, claimedAt: claimed.approving_at! };
