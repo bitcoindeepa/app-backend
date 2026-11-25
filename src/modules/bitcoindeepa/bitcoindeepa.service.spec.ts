@@ -248,10 +248,31 @@ describe('BitcoinDeepaService', () => {
       expect(result.outcome_unknown).toBeUndefined();
     });
 
-    it('classifies other 400s as rejected', async () => {
-      request.mockRejectedValue(apiError(400, 'Recipient not found'));
+    it.each([
+      [
+        'Could not deliver the approval request via Telegram. Nothing was sent; please retry.',
+        'APPROVAL_DELIVERY',
+      ],
+      [
+        "Transaction with memo 'One-time BTC purchase (Ref: P1)' is already processing",
+        'BUSY',
+      ],
+      ['Amount cannot exceed 300,000 sats (Rs. 60,000)', 'OVER_LIMIT'],
+      ['Memo cannot exceed 280 characters', 'REJECTED'],
+      ['Daily total cannot exceed 1,000,000 sats', 'REJECTED'],
+      ["Recipient '42' not found or has no wallet", 'NO_WALLET'],
+      [
+        'Insufficient balance: 10 sats available, 20 sats required',
+        'LOW_BALANCE',
+      ],
+      ['Amount must be greater than 1 sat', 'REJECTED'],
+      ['Recipient not found', 'REJECTED'],
+    ])('classifies the bot refusal "%s" as %s', async (message, failure) => {
+      request.mockRejectedValue(apiError(400, message));
       await expect(service.transferFunds(1, '42', 'm')).resolves.toMatchObject({
-        failure: 'REJECTED',
+        success: false,
+        message,
+        failure,
       });
     });
 

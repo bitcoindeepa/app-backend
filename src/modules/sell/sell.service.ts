@@ -28,6 +28,8 @@ import {
   BitcoinDeepaService,
   type CollectRequest,
   type CollectResult,
+  potSats,
+  spendableSats,
 } from '../bitcoindeepa/bitcoindeepa.service';
 import { P2pService } from '../p2p/p2p.service';
 import { isP2pEnabled } from '../../common/p2p-enabled';
@@ -429,13 +431,19 @@ export class SellService {
     if (!account) throw new BadRequestException('No verified bank account');
 
     const balance = await this.bitcoinDeepa.getUserBalance(Number(userId));
-    if (!balance.success || typeof balance.balance !== 'number') {
+    const spendable = spendableSats(balance);
+    if (!balance.success || spendable === undefined) {
       throw new ServiceUnavailableException(
         'Could not read your balance, please try again',
       );
     }
-    if (balance.balance < sats) {
-      throw new BadRequestException('Insufficient balance');
+    // Sats in savings pots stay in the wallet but can't be collected
+    if (spendable < sats) {
+      throw new BadRequestException(
+        spendable + potSats(balance) >= sats
+          ? `Insufficient balance: ${potSats(balance).toLocaleString('en-US')} sats are in savings pots. Withdraw them from the pot in the bot to sell them`
+          : 'Insufficient balance',
+      );
     }
 
     const rate = await this.sellRate();

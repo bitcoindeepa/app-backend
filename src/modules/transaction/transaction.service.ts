@@ -24,7 +24,12 @@ import {
 import { RedisService } from '../redis/redis.service';
 import { CacheKeys } from '../redis/utils/cache-keys.util';
 import { TelegramLoggerService } from '../telegram-logger/telegram-logger.service';
-import { BitcoinDeepaService } from '../bitcoindeepa/bitcoindeepa.service';
+import {
+  BitcoinDeepaService,
+  type UserBalancePot,
+  potSats,
+  spendableSats,
+} from '../bitcoindeepa/bitcoindeepa.service';
 import { PayHereService, payHereErrorDetail } from '../payhere/payhere.service';
 import { PayHereNotificationDto } from './dto/payhere-notification.dto';
 import { errorMessage } from '../../common/error-message';
@@ -112,6 +117,15 @@ export interface DcaSummary {
   total_lkr: string;
   /** False when the BitcoinDeepa wallet balance couldn't be fetched (total_* are then 0, not real) */
   balance_available: boolean;
+  /**
+   * Sats the member can move (sell, send): `total_balance` minus pots.
+   * `total_balance` is the whole wallet, pots included.
+   */
+  spendable_balance: number;
+  /** Sats locked in the member's savings pots in the bot (can't be moved until withdrawn there) */
+  pot_balance: number;
+  /** Each savings pot (name, sats), oldest first; [] when none */
+  pots: UserBalancePot[];
   currency: string;
   '24_hr_change': number;
   current_btc_price?: {
@@ -1740,9 +1754,12 @@ export class TransactionService {
     const cached = await this.redisService.get<DcaSummary>(key);
     if (cached) return cached;
     const summary = await this.computeDcaSummary(user_id);
-    // A missing wallet balance is retried soon instead of sticking for 5 min
+    // Short on purpose: the wallet balance and savings pots change in the bot
+    // (deposits, pot moves) without telling us, so a refresh should show them
+    // within seconds. This only absorbs bursts of requests (one bot call per
+    // member per 10 s); a payment, sale or send also clears it at once.
     await this.redisService.set(key, summary, {
-      ttl: summary.balance_available ? 300 : 30,
+      ttl: DCA_SUMMARY_TTL_SECONDS,
     });
     return summary;
   }
@@ -1818,6 +1835,9 @@ export class TransactionService {
     let total_balance = 0;
     let botLkr = '0.00';
     let balance_available = false;
+    let spendable_balance = 0;
+    let pot_balance = 0;
+    let pots: UserBalancePot[] = [];
     if (this.bitcoinDeepaService.isConfigured()) {
       const balance = await this.bitcoinDeepaService.getUserBalance(
         parseInt(user_id, 10),
@@ -1826,6 +1846,9 @@ export class TransactionService {
         total_balance = balance.balance ?? 0;
         botLkr = balance.balance_lkr ?? '0.00';
         balance_available = true;
+        spendable_balance = spendableSats(balance) ?? 0;
+        pot_balance = potSats(balance);
+        pots = Array.isArray(balance.pots) ? balance.pots : [];
       }
     }
 
@@ -1849,6 +1872,9 @@ export class TransactionService {
       total_balance,
       total_lkr,
       balance_available,
+      spendable_balance,
+      pot_balance,
+      pots,
       '24_hr_change': change24h ?? 0,
       current_btc_price: rate
         ? { usd: rate.btcUsd, lkr: rate.btcLkr }
@@ -1866,6 +1892,9 @@ export class TransactionService {
     );
   }
 }
+
+/** How long a member's dca-summary (wallet balance included) is cached */
+export const DCA_SUMMARY_TTL_SECONDS = 10;
 
 /** Sell statuses whose sats may have left the user's wallet (not refunded) */
 const SALE_PAID_STATUSES: SellStatus[] = [
