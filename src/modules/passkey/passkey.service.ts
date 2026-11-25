@@ -61,6 +61,13 @@ export interface PasskeyStatus {
   unlocked: boolean;
   /** Passkeys work for this session (web only; Telegram's webview can't run them) */
   available: boolean;
+  /**
+   * The web app asks for the passkey each time it opens (the member's
+   * setting: on when they add their first passkey, PATCH /passkey/settings
+   * changes it). Always false without a passkey. Sends and sale payments
+   * need an approval either way, and bank account changes an unlock.
+   */
+  lock_on_open: boolean;
   passkeys: PasskeyView[];
 }
 
@@ -95,15 +102,44 @@ export class PasskeyService {
   }
 
   async status(user: RequestUser): Promise<PasskeyStatus> {
-    const rows = await this.list(user.id);
+    const [rows, lockOnOpen] = await Promise.all([
+      this.list(user.id),
+      this.lockOnOpen(user.id),
+    ]);
     return {
       enabled: rows.length > 0,
       // No passkey = never locked, even if the session was read before the
       // last one was removed
       unlocked: rows.length === 0 || user.locked !== true,
       available: user.sessionKind === 'web' && relyingParty() !== null,
+      lock_on_open: rows.length > 0 && lockOnOpen,
       passkeys: rows.map(toView),
     };
+  }
+
+  /**
+   * Whether the web app asks for the passkey when it opens. Turning it off
+   * needs an unlocked session (like removing a passkey), so a borrowed
+   * session can't switch off the prompt; turning it on doesn't. 404
+   * passkey_not_set without a passkey.
+   */
+  async setLockOnOpen(
+    user: RequestUser,
+    enabled: boolean,
+  ): Promise<PasskeyStatus> {
+    this.webOnly(user);
+    if (!enabled) this.assertUnlocked(user);
+    const updated = await this.knex('user')
+      .where('id', user.id)
+      .whereExists(
+        this.knex('user_passkey').select(1).where('user_id', user.id),
+      )
+      .update({ passkey_lock_on_open: enabled });
+    if (!updated) throw this.noPasskeys();
+    this.logger.log(
+      `Passkey lock on open turned ${enabled ? 'on' : 'off'} for user ${user.id}`,
+    );
+    return this.status(user);
   }
 
   /** Options for navigator.credentials.create() */
@@ -219,9 +255,13 @@ export class PasskeyService {
         });
       }
 
-      // The first passkey locks every other session of the member
+      // The first passkey locks every other session of the member and turns
+      // the prompt on open back on (the default, whatever it was before)
       if (count === 0) {
         await this.sessions.lockOtherSessions(user.id, user.sessionId!, trx);
+        await trx('user')
+          .where('id', user.id)
+          .update({ passkey_lock_on_open: true });
       }
       await this.sessions.markUnlocked(user.sessionId!, trx);
     });
@@ -492,6 +532,15 @@ export class PasskeyService {
       .del();
     if (deleted) this.logger.warn(`Passkeys reset by admin for user ${userId}`);
     return deleted;
+  }
+
+  private async lockOnOpen(userId: string): Promise<boolean> {
+    const row = await this.knex('user')
+      .where('id', userId)
+      .first<
+        { passkey_lock_on_open: boolean } | undefined
+      >('passkey_lock_on_open');
+    return row?.passkey_lock_on_open ?? true;
   }
 
   private list(userId: string): Promise<PasskeyRow[]> {
