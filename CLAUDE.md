@@ -71,6 +71,7 @@ This is a NestJS-based backend service for the BitcoinDeepa DCA (Dollar Cost Ave
    - ID verification, liveness detection, face matching, and AML screening
    - Automatic user KYC status updates via webhooks: `X-Signature` (HMAC of raw body), `X-Timestamp` must be within 5 minutes; `DIDIT_WEBHOOK_SECRET` required in production
    - Sessions API v3 (`/v3/session/`); late `Not Started`/`In Progress` webhooks never overwrite a final KYC result; `Resubmitted` → `IN_PROGRESS`
+   - A `Declined` result posts a Telegram alert (`logAlert('KYC', ...)`) with the reason, each check's warnings from the webhook `decision` (`kyc-issues.util.ts`) and the Didit session id; once per decline (not when the user was already `DECLINED`), best effort (never fails the webhook)
    - Uses strongly typed KYC status enum for database consistency
 
 10. **Admin Module** (`src/modules/admin/`) - everything behind the admin dashboard. `AdminModule` bundles one Nest module per area: `auth/`, `analytics/`, `transactions/`, `members/`. List endpoints share `common/pagination.ts` (`PaginationQueryDto`, `@SearchQuery()`, `toPage`, `likeEscape`). Add new admin areas as sibling folders and import them in `admin.module.ts`
@@ -162,6 +163,7 @@ bun run test:e2e        # e2e against a disposable Postgres/Redis (see test/READ
 - Jest + `@nestjs/testing` + supertest. E2E boots the real `AppModule` via `configureApp()` (`src/app.setup.ts`, shared with `main.ts`) and stubs external services in `test/support/test-app.ts`.
 - E2E tests truncate tables and refuse to run against the `.env` database. Put new unit tests next to the code (`*.spec.ts`), new flows in `test/*.e2e-spec.ts`.
 - CI: `.github/workflows/test.yml` runs tsc, unit and e2e (Postgres + Redis services) on every PR.
+- Branches: features go to `dev`; hotfixes go to `main`. Every push to `main` makes `.github/workflows/backmerge.yml` open (or update) a `backmerge/main-into-dev` PR into `dev`: merge it with a merge commit, and resolve conflicts on that branch keeping every check from `main`. Set the `BACKMERGE_TOKEN` secret so CI runs on that PR automatically.
 
 ### Development Commands
 ```bash
@@ -460,7 +462,7 @@ try {
 - **Settlement also only pays payment_ids PayHere itself lists as `RECEIVED`** (`isConfirmedByPayHere`), with the recorded amount. The webhook's md5sig doesn't cover `payment_id`, and a payer can point the unsigned `notify_url` at their own server, so a genuine signed notification can be replayed with invented `payment_id`s: this lookup is what stops those being paid. One-time buys: Retrieval API by `order_id`. Subscription charges: Subscription Manager API by subscription, then, if it isn't listed there, the Retrieval API by the subscription's `payhere_order_id` (the Subscription Manager list has come back empty in live). Not listed: deferred with backoff (PayHere can lag), then an alert after the last attempt. A lookup error (outage, 401/403) gives the attempt back and payouts wait; 401/403 alerts at once, other failures after 30 min, at most hourly. Never remove this check to keep payouts flowing during a PayHere problem.
 - Settlement re-reads the payment after the PayHere lookup and sends nothing if it is no longer an unheld, unsettled SUCCESS (a chargeback that arrived after the claim); if an earlier send had no answer it still looks for the memo, and alerts if it can't tell. A chargeback arriving during the transfer itself can't be stopped: `markSettled` marks the payment settled and a second alert says the sats were sent.
 - **Reminder** (`settlement/review-reminder.service.ts`, every 3 h, once across instances): alerts are sent once and best effort, so this repeats what still waits for a human - sales in `NEEDS_REVIEW` (until their status changes), held one-time buys and SUCCESS payments whose settlement used all attempts (both for 7 days). Items newer than 30 min are left out. The rich version shows each group as a heading, its hint and a `<table bordered striped compact>`; the plain text fallback keeps one line per item.
-- Money math uses big.js, never floats: `satoshisFor` (sats for an amount, rounded down), `parseAmount` (PayHere's amount string; never `parseFloat`).
+- Money math uses bignumber.js through `src/common/money.ts`, never floats: `toMoney` (a DB decimal string, number or BigNumber in; never `Number()`/`parseFloat` on an amount), `lkr`/`usdt`/`sats` (round at 2/8/0 dp, the rounding mode is always named), `basisPointsOf`, `sameAmount` (compare amounts, never `===` on converted floats), `satoshisFor` (sats for an amount, rounded down), `parseAmount` (PayHere's amount string, as a decimal string). Postgres `decimal`/`bigint` and `SUM()` results arrive from `pg` as strings: pass them straight to `toMoney`. Convert to a JS number only at an API response (`toApiNumber`/`toApiNumberOrNull`, for whole sats and 2-dp LKR, which a double holds exactly) and say so in a comment.
 
 ### Fee System
 

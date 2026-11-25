@@ -1,3 +1,4 @@
+import { toApiNumber } from '../../common/money';
 import { Injectable, Logger } from '@nestjs/common';
 import axios from 'axios';
 import { Cron, CronExpression } from '@nestjs/schedule';
@@ -64,7 +65,7 @@ interface UnsettledTransaction {
   payhere_order_id: string | null;
   /** Recurring charges: the order_id their subscription was bound to */
   subscription_order_id?: string | null;
-  satoshis_purchased: number;
+  satoshis_purchased: number | string; // bigint: pg returns a string
   retry_count: number;
   telegram_id: string;
   created_at: Date;
@@ -78,7 +79,7 @@ interface UnsettledTransaction {
 interface AwaitingApprovalTransaction {
   payhere_pay_id: string;
   bot_send_id: string;
-  satoshis_purchased: number;
+  satoshis_purchased: number | string; // bigint: pg returns a string
   telegram_id: string;
   /** When the send that got the 202 was made */
   last_retry_at: Date | null;
@@ -269,11 +270,13 @@ export class SettlementService {
             );
             return;
           }
-          // Keep the marker the claim cleared, so the next attempt checks
-          // the bot history again
+          // Put back the marker the claim cleared, as it was, so the next
+          // attempt checks the bot history again. Not 'UNKNOWN' for a null
+          // one: null (an attempt nobody recorded, maybe with another memo)
+          // is what stops a resend while the history can't be read.
           await this.knexService
             .knex('transaction')
-            .update({ settlement_failure: 'UNKNOWN' })
+            .update({ settlement_failure: transaction.settlement_failure })
             .where('payhere_pay_id', payhere_pay_id)
             .where('retry_count', currentRetryCount);
           if (currentRetryCount >= MAX_SETTLEMENT_ATTEMPTS) {
@@ -403,7 +406,7 @@ export class SettlementService {
 
       const logMessage = await this.telegramLogger.logSettlement(
         payhere_pay_id,
-        Number(satoshis_purchased),
+        toApiNumber(satoshis_purchased), // whole sats: exact
         telegram_id,
         currentRetryCount,
       );

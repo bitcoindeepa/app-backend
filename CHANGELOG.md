@@ -8,13 +8,22 @@ To release: add the version's section below, bump `version` in `package.json`, m
 
 ### New
 - Alerts that need a human go to `ALERT_TOPIC_ID` (defaults to `LOG_TOPIC_ID`) (#75)
+- Admins get a Telegram alert when a member's KYC attempt is declined (#80)
 - Clearer errors from the PayHere API
+- Hotfixes merged to `main` open a back-merge PR into `dev` automatically (#81)
 
 ### Changed
 - Sales and purchases are linked to their bot transfers by payment hash (#71)
 - One-time buys show "Sats Purchase" on the PayHere checkout
-- Settlement no longer looks payments up with PayHere's API
+- All money arithmetic uses bignumber.js through `src/common/money.ts` (#74)
+- `package.amount` is `decimal(18, 2)` instead of a float (#79)
 - README updated; licensed under AGPL-3.0 (#72)
+
+### Security
+- The PayHere webhook checks new `payment_id`s with PayHere before recording them, and settlement only pays `payment_id`s PayHere lists as `RECEIVED` with the recorded amount, so replayed notifications with invented `payment_id`s are never paid (#77)
+
+### Upgrading
+- 1 new migration: `20261205000000_package_amount_decimal`, applied on startup in production (#79)
 
 ## [2.0.1] - 2026-11-20
 
