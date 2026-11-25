@@ -10,6 +10,7 @@
       "**/*.ts",
       "**/*.js",
       "package.json",
+      "Dockerfile",
       "knexfile.ts",
       "migrations/**/*",
       "seeds/**/*"
