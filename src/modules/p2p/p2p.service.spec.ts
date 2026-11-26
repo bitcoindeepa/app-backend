@@ -5,6 +5,7 @@ import type { P2pBotClient } from './p2p-bot.client';
 import type { RedisService } from '../redis/redis.service';
 import type { TelegramLoggerService } from '../telegram-logger/telegram-logger.service';
 import type { UserService } from '../user/user.service';
+import type { BitcoinPriceService } from '../bitcoin-price/bitcoin-price.service';
 
 /** Login only: the fresh Telegram credential for /api/v1/init */
 const credential = { kind: 'initData' as const, value: 'init' };
@@ -31,11 +32,13 @@ describe('P2pService', () => {
   const redis = { setIfAbsent: jest.fn(), del: jest.fn() };
   const telegramLogger = { logAlert: jest.fn().mockResolvedValue(undefined) };
   const users = { getUserByUsername: jest.fn() };
+  const prices = { getLoggedRateAt: jest.fn() };
   const service = new P2pService(
     bot as unknown as P2pBotClient,
     redis as unknown as RedisService,
     telegramLogger as unknown as TelegramLoggerService,
     users as unknown as UserService,
+    prices as unknown as BitcoinPriceService,
   );
   const send = (extra = {}) =>
     service.send('42', {
@@ -49,6 +52,7 @@ describe('P2pService', () => {
     jest.clearAllMocks();
     bot.isConfigured.mockReturnValue(true);
     redis.setIfAbsent.mockResolvedValue(true);
+    prices.getLoggedRateAt.mockResolvedValue(null);
   });
 
   it('sends exactly the documented fields (memo only when given) as the session user', async () => {
@@ -58,7 +62,7 @@ describe('P2pService', () => {
     });
     await expect(send()).resolves.toEqual({
       status: 202,
-      body: { id: 'p2p-a', status: 'awaiting_confirmation' },
+      body: { id: 'p2p-a', status: 'awaiting_confirmation', value_lkr: null },
     });
     expect(bot.request).toHaveBeenCalledWith(
       'POST',
@@ -86,6 +90,69 @@ describe('P2pService', () => {
     expect(redis.del).toHaveBeenCalledWith(
       CacheKeys.transaction.dcaSummary('7'),
     );
+  });
+
+  describe('value_lkr: the value when it was sent, from our rate log', () => {
+    const transfer = {
+      id: 'p2p-a',
+      status: 'completed',
+      amount: 21_000,
+      // What the bot sends: today's price from its own feed, as a display string
+      amount_lkr: '21,000 sats (රු. 6,000.00)',
+      created_at: '2026-11-26T13:13:00Z',
+    };
+    const rate = (btcLkr: number) => ({
+      id: '9',
+      loggedAt: new Date('2026-11-26T13:12:41Z'),
+      btcLkr,
+      btcUsd: 90_000,
+      usdtLkr: 300,
+    });
+
+    it("prices the transfer at the logged rate nearest its created_at and drops the bot's amount_lkr", async () => {
+      bot.request.mockResolvedValue({ status: 200, body: transfer });
+      prices.getLoggedRateAt.mockResolvedValue(rate(27_000_000));
+      const { body } = await service.transfer('42', 'p2p-a');
+      expect(prices.getLoggedRateAt).toHaveBeenCalledWith(
+        new Date('2026-11-26T13:13:00Z'),
+      );
+      // 21,000 sats × 27,000,000 LKR/BTC = 5,670.00
+      expect(body.value_lkr).toBe(5670);
+      expect(body).not.toHaveProperty('amount_lkr');
+      expect(body).toMatchObject({ id: 'p2p-a', amount: 21_000 });
+    });
+
+    it('1 sat keeps its cents (rounded half up)', async () => {
+      bot.request.mockResolvedValue({
+        status: 200,
+        body: { ...transfer, amount: 1 },
+      });
+      prices.getLoggedRateAt.mockResolvedValue(rate(21_345_678.9));
+      const { body } = await service.transfer('42', 'p2p-a');
+      expect(body.value_lkr).toBe(0.21);
+    });
+
+    it('also on the send response', async () => {
+      bot.request.mockResolvedValue({ status: 200, body: transfer });
+      prices.getLoggedRateAt.mockResolvedValue(rate(27_000_000));
+      const { body } = await send();
+      expect(body.value_lkr).toBe(5670);
+    });
+
+    it('null when no logged rate is close enough, or the bot sent no time', async () => {
+      bot.request.mockResolvedValue({ status: 200, body: transfer });
+      const { body } = await service.transfer('42', 'p2p-a');
+      expect(body.value_lkr).toBeNull();
+
+      prices.getLoggedRateAt.mockClear();
+      bot.request.mockResolvedValue({
+        status: 200,
+        body: { ...transfer, created_at: undefined },
+      });
+      const { body: noTime } = await service.transfer('42', 'p2p-a');
+      expect(noTime.value_lkr).toBeNull();
+      expect(prices.getLoggedRateAt).not.toHaveBeenCalled();
+    });
   });
 
   describe('resolveRecipient (our usernames, from the DB)', () => {
