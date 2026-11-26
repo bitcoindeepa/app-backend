@@ -31,6 +31,13 @@ export interface BtcLkrRate {
   usdtLkr: number;
 }
 
+/**
+ * getLoggedRateAt only uses a row this close to the moment asked about. The
+ * log has a row a minute while the price is up; a bigger gap means the price
+ * was down then, and a row further away could be a different price.
+ */
+export const RATE_AT_MAX_GAP_SECONDS = 300;
+
 /** A rate read back from exchange_rate_log. */
 export interface LoggedBtcLkrRate extends BtcLkrRate {
   /** exchange_rate_log.id */
@@ -263,6 +270,53 @@ export class BitcoinPriceService {
    * that has already been made while the live price is down - quotes and
    * displayed prices stay live. Null when there is none. Never throws.
    */
+  /**
+   * The logged BTC/LKR rate nearest to `at` (rows before or after it), within
+   * RATE_AT_MAX_GAP_SECONDS. For showing what something was worth when it
+   * happened (a P2P send's value), never for pricing a payment. Null when no
+   * row is that close (before the log existed, an outage, or
+   * ENABLE_BITCOIN_TRACKING off). Never throws.
+   */
+  async getLoggedRateAt(at: Date): Promise<LoggedBtcLkrRate | null> {
+    if (Number.isNaN(at.getTime())) return null;
+    try {
+      const knex = this.knexService.knex;
+      const row = await knex('exchange_rate_log')
+        .select('id', 'btc_usd', 'usdt_lkr', 'btc_lkr', 'created_at')
+        // Inactive rows too: every row but the newest is inactive
+        .whereBetween('created_at', [
+          new Date(at.getTime() - RATE_AT_MAX_GAP_SECONDS * 1000),
+          new Date(at.getTime() + RATE_AT_MAX_GAP_SECONDS * 1000),
+        ])
+        .orderByRaw('abs(extract(epoch from created_at - ?::timestamptz))', [
+          at.toISOString(),
+        ])
+        .first<
+          | {
+              id: string;
+              btc_usd: string;
+              usdt_lkr: string;
+              btc_lkr: string;
+              created_at: Date;
+            }
+          | undefined
+        >();
+      if (!row) return null;
+      return {
+        id: String(row.id),
+        loggedAt: new Date(row.created_at),
+        btcLkr: toApiNumber(row.btc_lkr),
+        btcUsd: toApiNumber(row.btc_usd),
+        usdtLkr: toApiNumber(row.usdt_lkr),
+      };
+    } catch (error) {
+      this.logger.error(
+        `Reading the exchange rate at ${at.toISOString()}: ${errorMessage(error)}`,
+      );
+      return null;
+    }
+  }
+
   async getRecentLoggedRate(): Promise<LoggedBtcLkrRate | null> {
     const maxAge = fallbackMaxAgeSeconds();
     if (maxAge === 0) return null;

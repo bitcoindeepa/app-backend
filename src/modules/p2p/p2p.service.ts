@@ -16,6 +16,14 @@ import { RedisService } from '../redis/redis.service';
 import { CacheKeys } from '../redis/utils/cache-keys.util';
 import { TelegramLoggerService } from '../telegram-logger/telegram-logger.service';
 import { errorMessage } from '../../common/error-message';
+import {
+  lkr,
+  ROUND_HALF_UP,
+  SATOSHIS_PER_BTC,
+  toApiNumber,
+  toMoney,
+} from '../../common/money';
+import { BitcoinPriceService } from '../bitcoin-price/bitcoin-price.service';
 import { UserService } from '../user/user.service';
 import {
   maskDisplayName,
@@ -81,6 +89,7 @@ export class P2pService {
     private readonly redis: RedisService,
     private readonly telegramLogger: TelegramLoggerService,
     private readonly users: UserService,
+    private readonly prices: BitcoinPriceService,
   ) {}
 
   async me(userId: string): Promise<P2pResult> {
@@ -177,7 +186,7 @@ export class P2pService {
     if (result.body.status === 'completed') {
       await this.clearWalletCaches(userId, dto.to_telegram_id);
     }
-    return result;
+    return this.withValueAtSend(result);
   }
 
   /**
@@ -195,12 +204,44 @@ export class P2pService {
   }
 
   async transfer(userId: string, id: string): Promise<P2pResult> {
-    return this.call(
-      'GET',
-      `${P2P_PATH}/transfers/${encodeURIComponent(id)}`,
-      user(userId),
-      'read',
+    return this.withValueAtSend(
+      await this.call(
+        'GET',
+        `${P2P_PATH}/transfers/${encodeURIComponent(id)}`,
+        user(userId),
+        'read',
+      ),
     );
+  }
+
+  /**
+   * Adds `value_lkr`: the transfer's sats in LKR at our rate when it was
+   * made (exchange_rate_log at its created_at, the price the app quoted),
+   * so it doesn't move with today's price. Null when no logged rate is close
+   * enough (before the log existed, or the price was down). The bot's own
+   * `amount_lkr` is dropped: it's today's price from another feed, as a
+   * display string.
+   */
+  private async withValueAtSend(result: P2pResult): Promise<P2pResult> {
+    const body = { ...result.body };
+    delete body.amount_lkr;
+    const amount = body.amount;
+    const createdAt =
+      typeof body.created_at === 'string' ? new Date(body.created_at) : null;
+    let value: number | null = null;
+    if (typeof amount === 'number' && amount > 0 && createdAt) {
+      const rate = await this.prices.getLoggedRateAt(createdAt);
+      if (rate) {
+        // 2-dp LKR, which a double holds exactly (API response)
+        value = toApiNumber(
+          lkr(
+            toMoney(amount).times(toMoney(rate.btcLkr)).div(SATOSHIS_PER_BTC),
+            ROUND_HALF_UP,
+          ),
+        );
+      }
+    }
+    return { status: result.status, body: { ...body, value_lkr: value } };
   }
 
   private async call(
