@@ -6,6 +6,10 @@ To release: add the version's section below, bump `version` in `package.json`, a
 
 ## [Unreleased]
 
+### New
+
+- **Switch plans without cancelling first**: `POST /subscription/payhere-link { package_id, switch: true }` opens a checkout for another package while a plan is active. The old plan keeps running until the new plan's first payment succeeds; the webhook then makes the new plan active, retires the old one and cancels it at PayHere (alert if PayHere refuses). An abandoned or declined switch changes nothing. Without `switch`, a member with an active plan still gets 409. Migration: `buy_order.replaces_payhere_sub_id`
+
 ## [2.1.0] - 2026-11-26
 
 ### New

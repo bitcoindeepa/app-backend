@@ -43,10 +43,14 @@ export class SubscriptionService {
     order_id: string,
     user_id: string,
     package_id: string,
+    replaces_payhere_sub_id?: string,
   ): Promise<void> {
-    await this.knexService
-      .knex('buy_order')
-      .insert({ order_id, user_id, package_id });
+    await this.knexService.knex('buy_order').insert({
+      order_id,
+      user_id,
+      package_id,
+      replaces_payhere_sub_id: replaces_payhere_sub_id ?? null,
+    });
   }
 
   async getCurrentSubscriptionDetailsForUser(

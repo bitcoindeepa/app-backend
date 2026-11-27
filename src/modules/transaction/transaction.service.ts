@@ -201,6 +201,15 @@ type PaymentLink =
   | { kind: 'RECURRING'; payhere_sub_id: string; payhere_order_id: null }
   | { kind: 'ONE_TIME'; payhere_sub_id: null; payhere_order_id: string };
 
+/**
+ * What a subscription's first SUCCESS did when another plan was active:
+ * replaced it (a plan switch the member asked for) or was left inactive as a
+ * duplicate checkout.
+ */
+type Activation =
+  | { kind: 'SWITCHED'; replacedSubId: string }
+  | { kind: 'DUPLICATE'; activeSubId: string };
+
 interface BuyOrderRow {
   order_id: string;
   user_id: string;
@@ -676,6 +685,8 @@ export class TransactionService {
     let userId = '';
     let duplicate: { payhere_sub_id: string; activeSubId: string } | null =
       null;
+    let switched: { payhere_sub_id: string; replacedSubId: string } | null =
+      null;
     let createdSubscription: { user_id: string; package_id: string } | null =
       null;
 
@@ -741,15 +752,20 @@ export class TransactionService {
       });
 
       if (becameSuccess && subscription && !subscriptionEnded) {
-        const duplicateOf = await this.activateIfFirstSuccess(
+        const activation = await this.activateIfFirstSuccess(
           trx,
           subscription,
           payment_id,
         );
-        if (duplicateOf) {
+        if (activation?.kind === 'DUPLICATE') {
           duplicate = {
             payhere_sub_id: subscription_id,
-            activeSubId: duplicateOf,
+            activeSubId: activation.activeSubId,
+          };
+        } else if (activation?.kind === 'SWITCHED') {
+          switched = {
+            payhere_sub_id: subscription_id,
+            replacedSubId: activation.replacedSubId,
           };
         }
       }
@@ -796,6 +812,14 @@ export class TransactionService {
         createdSubscription.user_id,
         createdSubscription.package_id,
       );
+    }
+    if (switched) {
+      const alert = await this.cancelReplacedSubscription(
+        switched.replacedSubId,
+        switched.payhere_sub_id,
+        userId,
+      );
+      if (alert) alerts.push(alert);
     }
     if (duplicate) {
       alerts.push(
@@ -1164,14 +1188,15 @@ export class TransactionService {
   /**
    * Subscriptions start inactive. Activate one on its first SUCCESS - but
    * never re-activate a cancelled one (those already had a SUCCESS) and never
-   * create a second active plan. Returns the user's other active
-   * subscription id when this one is a duplicate (left inactive).
+   * create a second active plan. When another plan is active, this one
+   * replaces it if its checkout was a switch from exactly that plan
+   * (SWITCHED), else it is a duplicate and stays inactive (DUPLICATE).
    */
   private async activateIfFirstSuccess(
     trx: Knex.Transaction,
     subscription: Subscription,
     payment_id: string,
-  ): Promise<string | null> {
+  ): Promise<Activation | null> {
     if (subscription.is_active) return null;
 
     const priorSuccess = await trx('transaction')
@@ -1198,10 +1223,39 @@ export class TransactionService {
       .whereNot('payhere_sub_id', subscription.payhere_sub_id)
       .first();
     if (otherActive) {
+      // A plan switch: this checkout was opened to replace exactly that plan
+      // (buy_order.replaces_payhere_sub_id, stored by the link endpoint for
+      // the same member). Swap them here, in the webhook's transaction; the
+      // old plan is cancelled at PayHere after commit.
+      const order:
+        | (Pick<BuyOrderRow, 'user_id'> & {
+            replaces_payhere_sub_id: string | null;
+          })
+        | undefined = subscription.payhere_order_id
+        ? await trx('buy_order')
+            .where('order_id', subscription.payhere_order_id)
+            .first('user_id', 'replaces_payhere_sub_id')
+        : undefined;
+      if (
+        order?.replaces_payhere_sub_id === otherActive.payhere_sub_id &&
+        order.user_id === subscription.user_id
+      ) {
+        await trx('subscription')
+          .update({ is_active: false, updated_at: trx.fn.now() })
+          .where('payhere_sub_id', otherActive.payhere_sub_id);
+        await trx('subscription')
+          .update({ is_active: true, updated_at: trx.fn.now() })
+          .where('payhere_sub_id', subscription.payhere_sub_id);
+        this.logger.log(
+          `Subscription ${subscription.payhere_sub_id} activated by first successful payment ${payment_id}, replacing ${otherActive.payhere_sub_id} (plan switch)`,
+        );
+        return { kind: 'SWITCHED', replacedSubId: otherActive.payhere_sub_id };
+      }
+
       this.logger.warn(
         `Subscription ${subscription.payhere_sub_id} got its first SUCCESS (${payment_id}) but user ${subscription.user_id} already has active subscription ${otherActive.payhere_sub_id} - leaving it inactive`,
       );
-      return otherActive.payhere_sub_id;
+      return { kind: 'DUPLICATE', activeSubId: otherActive.payhere_sub_id };
     }
 
     await trx('subscription')
@@ -1211,6 +1265,31 @@ export class TransactionService {
       `Subscription ${subscription.payhere_sub_id} activated by first successful payment ${payment_id}`,
     );
     return null;
+  }
+
+  /**
+   * A plan switch went through: the replaced plan is already inactive in our
+   * DB, so stop PayHere billing it. Returns alert text only when a human has
+   * to cancel it by hand (PayHere refused or the call failed); a charge that
+   * still comes for it is recorded and settled like any other (they paid).
+   */
+  private async cancelReplacedSubscription(
+    replacedSubId: string,
+    newSubId: string,
+    user_id: string,
+  ): Promise<string | null> {
+    const base = `Plan switch: user ${user_id} moved from ${replacedSubId} to ${newSubId}, and ${replacedSubId} is inactive here.`;
+    try {
+      const result =
+        await this.payHereService.cancelSubscription(replacedSubId);
+      if (result.status === 1) {
+        this.logger.log(`${base} Cancelled at PayHere.`);
+        return null;
+      }
+      return `${base} PayHere refused to cancel it (${result.msg}) - cancel it manually, or PayHere keeps billing it.`;
+    } catch (error: unknown) {
+      return `${base} Cancelling at PayHere failed (${errorMessage(error)}) - cancel it manually, or PayHere keeps billing it.`;
+    }
   }
 
   /**
