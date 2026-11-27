@@ -59,15 +59,23 @@ export class SubscriptionController {
     @Body() body: PayHereLinkDto,
   ): Promise<{ link: string }> {
     return this.telegramLoggerService.trackAction(
-      '🛒 Plan checkout link',
+      body.switch ? '🛒 Plan switch checkout link' : '🛒 Plan checkout link',
       user,
       async () => {
         const existingSubscription =
           await this.subscriptionService.getCurrentSubscriptionForUser(user.id);
-        if (existingSubscription?.is_active) {
+        // A member has one plan at a time. With `switch`, the active plan is
+        // retired by the webhook once this checkout's first payment succeeds.
+        const replaces = existingSubscription?.is_active
+          ? existingSubscription
+          : undefined;
+        if (replaces && !body.switch) {
           throw new ConflictException(
             'User already has an active subscription',
           );
+        }
+        if (replaces && replaces.package_id === body.package_id) {
+          throw new ConflictException('User is already on this plan');
         }
 
         const _package = await this.packageService.getPackageById(
@@ -89,6 +97,7 @@ export class SubscriptionController {
           orderId,
           user.id,
           _package.id,
+          replaces?.payhere_sub_id,
         );
         const link = this.payHereService.getLink({
           user_id: user.id,
@@ -110,7 +119,7 @@ export class SubscriptionController {
         });
 
         this.logger.log(
-          `Payment link generated for user ${user.id}, package ${_package.name} (${_package.amount} ${_package.currency}), order ${orderId}`,
+          `Payment link generated for user ${user.id}, package ${_package.name} (${_package.amount} ${_package.currency}), order ${orderId}${replaces ? `, replacing ${replaces.payhere_sub_id}` : ''}`,
         );
         return { link };
       },

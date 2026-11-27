@@ -131,7 +131,7 @@ This is a NestJS-based backend service for the BitcoinDeepa DCA (Dollar Cost Ave
 - `user`: User profiles (Telegram ID as PK, `passkey_lock_on_open` (web app asks for the passkey on open, default true), `telegram_sub` (web OIDC sub, nullable unique), personal info, address, KYC status and verification data, `avatar_seed`, `username`: the member's own Bitcoin Deepa @username, unique, lower-case, CHECK `^[a-z][a-z0-9_]{2,19}$`, claimed once; `tg_username`: their Telegram username as Telegram sent it at the last login (Mini App `user.username`, web `preferred_username`, null when none; updated on every login, not unique, for ops logs only). On the request user these are `username` (app) and `tgUsername` (Telegram); a legacy JWT's username is the Telegram one)
 - `subscription`: Active subscriptions (PayHere sub ID as PK, user ID, package ID, is_active)
 - `transaction`: Payment records (PayHere pay ID as PK, `kind` RECURRING/ONE_TIME, `transfer_memo` (the bot memo its sats are sent with), `user_id` (owner - read paths, settlement and admin use this, not the subscription), subscription ID (recurring only), `payhere_order_id` (one-time only), status, Bitcoin price, satoshis purchased, fee tracking, timestamps)
-- `buy_order`: Every checkout we start (order_id → user; `kind`; package for RECURRING, amount + currency for ONE_TIME)
+- `buy_order`: Every checkout we start (order_id → user; `kind`; package for RECURRING, amount + currency for ONE_TIME; `replaces_payhere_sub_id` = the plan a switch checkout replaces)
 - `user_bank_account`: Payout bank accounts (status PENDING_REVIEW/VERIFIED/REJECTED, statement R2 key, name-match score, reviewer, CeyPay bank id). `user.ceypay_user_id` links the user to CeyPay
 - `exchange_rate_log`: BTC/LKR rate history (BTC/USD, USDT/LKR, BTC/LKR, `is_active` = the current row, at most one)
 - `sell_order`: Sell orders (sats, gross LKR, fee LKR, bank charge LKR, BTC/LKR rate, promised LKR, CeyPay quote/payment ids, bank ref, status, retries)
@@ -307,7 +307,7 @@ PORT=3000
 
 ### Subscriptions
 - `GET /subscription/current` - Get user's current subscription (authenticated)
-- `POST /subscription/payhere-link` - Generate PayHere payment link (authenticated, **requires KYC verification**)
+- `POST /subscription/payhere-link { package_id, switch? }` - Generate PayHere payment link (authenticated, **requires KYC verification**). With an active plan: 409 unless `switch: true` (409 too for the same package); a switch checkout stores `buy_order.replaces_payhere_sub_id`, and the old plan keeps running until the new one's first SUCCESS
 - `POST /subscription/cancel` - Cancel active subscription (authenticated)
 
 ### KYC Verification
@@ -460,6 +460,7 @@ try {
 - PayHere's md5sig (and the checkout hash) only cover merchant_id, order_id, amount, currency (and status_code). `custom_1`/`custom_2` are payer-editable and never trusted: `POST /subscription/payhere-link` stores a `buy_order` row (order_id → user, package), and the webhook creates subscriptions only from that row. Unknown order_ids are rejected with a Telegram alert. Each subscription is bound to its `payhere_order_id`.
 - Status transitions: SUCCESS can only become CHARGEBACK, CHARGEBACK is final, nothing goes back to PENDING. Out-of-order notifications are ignored.
 - A new subscription is `is_active = true` only if its first payment is SUCCESS; otherwise it is activated by its first SUCCESS.
+- **Plan switch**: a first SUCCESS while another plan is active replaces that plan only when its order's `replaces_payhere_sub_id` is exactly that plan (same member): both flip in the webhook's transaction, then the old plan is cancelled at PayHere after commit (alert if PayHere refuses or fails: a human cancels it, or it keeps billing). Otherwise it's a duplicate checkout: left inactive and cancelled at PayHere. An abandoned/declined switch changes nothing.
 - `item_rec_status` -1/1 or `message_type` RECURRING_STOPPED/RECURRING_COMPLETE marks the subscription inactive.
 - SUCCESS payments saved without BTC price data (price API down and no recent rate in `exchange_rate_log`) are backfilled by a cron every minute.
 - **BitcoinDeepa bot API** (`src/modules/bitcoindeepa/`): every call is Ed25519-signed (`X-Wallet-ID`, `X-Timestamp`, `X-Nonce`, `X-Signature` over `BDB-SEND-ED25519-V1\nMETHOD\nPATH\nQUERY\nTS\nNONCE\nsha256hex(body)`; sign the exact bytes sent, new nonce per call). Env `BITCOINDEEPA_API_URL`, `BITCOINDEEPA_WALLET_ID`, `BITCOINDEEPA_PRIVATE_KEY_PEM`; `/send` timeout `BITCOINDEEPA_SEND_TIMEOUT` (95s). A 401/403 alerts at once (key/wallet/clock/IP).

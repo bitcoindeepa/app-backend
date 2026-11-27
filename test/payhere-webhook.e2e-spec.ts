@@ -606,6 +606,169 @@ describe('PayHere webhook (e2e)', () => {
     });
   });
 
+  describe('plan switch', () => {
+    const auth = () => ({ Authorization: `Bearer ${ctx.tokenFor(USER)}` });
+    let alert: jest.SpyInstance;
+    beforeEach(async () => {
+      alert = jest.spyOn(ctx.app.get(TelegramLoggerService), 'logAlert');
+      // USER is on the weekly plan (S1)
+      const first = await newOrder(PACKAGE_WEEKLY);
+      await notify({
+        ...first,
+        payment_id: 'P1',
+        subscription_id: 'S1',
+      }).expect(200);
+    });
+    afterEach(() => alert.mockRestore());
+
+    async function switchOrder(packageId = PACKAGE_MONTHLY) {
+      const res = await http()
+        .post('/subscription/payhere-link')
+        .set(auth())
+        .send({ package_id: packageId, switch: true })
+        .expect(201);
+      const link = new URL(res.body.link as string);
+      return {
+        order_id: link.searchParams.get('order_id')!,
+        amount: link.searchParams.get('amount')!,
+      };
+    }
+
+    it('a link with an active plan still needs switch, and not to the same plan', async () => {
+      await http()
+        .post('/subscription/payhere-link')
+        .set(auth())
+        .send({ package_id: PACKAGE_MONTHLY })
+        .expect(409);
+      await http()
+        .post('/subscription/payhere-link')
+        .set(auth())
+        .send({ package_id: PACKAGE_WEEKLY, switch: true })
+        .expect(409);
+      const { order_id } = await switchOrder();
+      expect(await row('buy_order', { order_id })).toMatchObject({
+        replaces_payhere_sub_id: 'S1',
+      });
+    });
+
+    it("the new plan's first SUCCESS replaces the old one and cancels it at PayHere", async () => {
+      const order = await switchOrder();
+      await notify({
+        ...order,
+        payment_id: 'P2',
+        subscription_id: 'S2',
+      }).expect(200);
+
+      expect(await row('subscription', { payhere_sub_id: 'S1' })).toMatchObject(
+        { is_active: false },
+      );
+      expect(await row('subscription', { payhere_sub_id: 'S2' })).toMatchObject(
+        { is_active: true, package_id: PACKAGE_MONTHLY },
+      );
+      expect(ctx.payHereCancel).toHaveBeenCalledWith('S1');
+      expect(ctx.payHereCancel).not.toHaveBeenCalledWith('S2');
+      expect(alert).not.toHaveBeenCalled();
+      // its first charge is a normal priced payment
+      expect(await row('transaction', { payhere_pay_id: 'P2' })).toMatchObject({
+        status: 'SUCCESS',
+        user_id: USER,
+      });
+
+      const current = await http()
+        .get('/subscription/current')
+        .set(auth())
+        .expect(200);
+      expect(current.body).toMatchObject({
+        payhere_sub_id: 'S2',
+        frequency: 'monthly',
+      });
+    });
+
+    it('an abandoned or declined switch checkout leaves the old plan running', async () => {
+      const order = await switchOrder();
+      await notify({
+        ...order,
+        payment_id: 'P2',
+        subscription_id: 'S2',
+        status_code: '-2',
+      }).expect(200);
+
+      expect(await row('subscription', { payhere_sub_id: 'S1' })).toMatchObject(
+        { is_active: true },
+      );
+      expect(ctx.payHereCancel).not.toHaveBeenCalled();
+    });
+
+    it('alerts when PayHere refuses to cancel the replaced plan', async () => {
+      ctx.payHereCancel.mockResolvedValueOnce({
+        status: -1,
+        msg: 'Unable to cancel',
+      });
+      const order = await switchOrder();
+      await notify({
+        ...order,
+        payment_id: 'P2',
+        subscription_id: 'S2',
+      }).expect(200);
+
+      // our side is switched either way; a human stops PayHere billing S1
+      expect(await row('subscription', { payhere_sub_id: 'S1' })).toMatchObject(
+        { is_active: false },
+      );
+      expect(await row('subscription', { payhere_sub_id: 'S2' })).toMatchObject(
+        { is_active: true },
+      );
+      expect(alert).toHaveBeenCalledWith(
+        'PayHere webhook',
+        expect.stringContaining('Plan switch'),
+      );
+    });
+
+    it('a switch from a plan the member already cancelled just activates', async () => {
+      const order = await switchOrder();
+      await http().post('/subscription/cancel').set(auth()).expect(201);
+      ctx.payHereCancel.mockClear();
+      await notify({
+        ...order,
+        payment_id: 'P2',
+        subscription_id: 'S2',
+      }).expect(200);
+
+      expect(await row('subscription', { payhere_sub_id: 'S2' })).toMatchObject(
+        { is_active: true },
+      );
+      expect(ctx.payHereCancel).not.toHaveBeenCalled();
+    });
+
+    it("a switch checkout doesn't replace a plan other than the one it was opened for", async () => {
+      const order = await switchOrder(); // replaces S1
+      // S1 ends and the member starts another plan before paying the switch
+      await http().post('/subscription/cancel').set(auth()).expect(201);
+      const other = await newOrder(PACKAGE_WEEKLY);
+      await notify({
+        ...other,
+        payment_id: 'P3',
+        subscription_id: 'S3',
+      }).expect(200);
+      ctx.payHereCancel.mockClear();
+
+      await notify({
+        ...order,
+        payment_id: 'P2',
+        subscription_id: 'S2',
+      }).expect(200);
+
+      // S3 stays; the late switch checkout is a duplicate
+      expect(await row('subscription', { payhere_sub_id: 'S3' })).toMatchObject(
+        { is_active: true },
+      );
+      expect(await row('subscription', { payhere_sub_id: 'S2' })).toMatchObject(
+        { is_active: false },
+      );
+      expect(ctx.payHereCancel).toHaveBeenCalledWith('S2');
+    });
+  });
+
   describe('re-sent and mislabelled notifications', () => {
     it('a resent SUCCESS does not re-activate a cancelled plan', async () => {
       const { order_id } = await newOrder();
